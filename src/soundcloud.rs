@@ -299,29 +299,134 @@ impl Client {
             .flatten()
             .map(|item| &item["track"])
             .collect();
+        self.complete(&items).await
+    }
+
+    /// Turns API items into tracks. Older likes and most playlist entries come back as bare
+    /// ids, which are fetched in batches; the order of `items` is kept.
+    async fn complete(&self, items: &[&Value]) -> Res<Vec<Track>> {
         let mut tracks: Vec<Option<Track>> = items.iter().map(|v| parse_track(v)).collect();
-        // Older likes come back as bare ids; fetch their details in one request.
         let missing: Vec<String> = items
             .iter()
             .zip(&tracks)
             .filter(|(_, parsed)| parsed.is_none())
             .filter_map(|(v, _)| v["id"].as_u64())
             .map(|id| id.to_string())
-            .take(50)
             .collect();
-        if !missing.is_empty() {
-            let ids = missing.join(",");
+        for batch in missing.chunks(50) {
+            let ids = batch.join(",");
             let full = self
                 .call(reqwest::Method::GET, &format!("{API}/tracks"), &[("ids", &ids)])
                 .await?;
             let full: Vec<Track> = full.as_array().into_iter().flatten().filter_map(parse_track).collect();
-            for (slot, item) in tracks.iter_mut().zip(&items) {
+            for (slot, item) in tracks.iter_mut().zip(items) {
                 if slot.is_none() {
                     *slot = full.iter().find(|t| Some(t.id) == item["id"].as_u64()).cloned();
                 }
             }
         }
         Ok(tracks.into_iter().flatten().collect())
+    }
+
+    /// The tracks of one playlist or album, at most `limit` of them.
+    async fn playlist_tracks(&self, id: u64, limit: usize) -> Res<Vec<Track>> {
+        let value = self.call(reqwest::Method::GET, &format!("{API}/playlists/{id}"), &[]).await?;
+        let items: Vec<&Value> = value["tracks"].as_array().into_iter().flatten().take(limit).collect();
+        self.complete(&items).await
+    }
+
+    /// A playlist or album that fits `query`: the user's own and liked ones first, then a
+    /// public search. Returns its title and tracks.
+    pub async fn playlist(&self, query: &str, limit: usize) -> Res<Option<(String, Vec<Track>)>> {
+        let mut candidates: Vec<(u64, String)> = Vec::new();
+        if self.logged_in()
+            && let Ok(user) = self.me().await
+            && let Ok(value) = self
+                .call(
+                    reqwest::Method::GET,
+                    &format!("{API}/users/{user}/playlists/liked_and_owned"),
+                    &[("limit", "50")],
+                )
+                .await
+        {
+            let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+            let mut own: Vec<(usize, u64, String)> = value["collection"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| {
+                    let playlist = if item["playlist"].is_object() { &item["playlist"] } else { item };
+                    let title = playlist["title"].as_str()?.to_owned();
+                    let lower = title.to_lowercase();
+                    let hits = words.iter().filter(|w| lower.contains(w.as_str())).count();
+                    (hits == words.len() && !words.is_empty()).then(|| (hits, playlist["id"].as_u64().unwrap_or(0), title))
+                })
+                .filter(|(_, id, _)| *id != 0)
+                .collect();
+            own.sort_by_key(|(hits, ..)| std::cmp::Reverse(*hits));
+            candidates.extend(own.into_iter().map(|(_, id, title)| (id, title)));
+        }
+        let found = self
+            .call(reqwest::Method::GET, &format!("{API}/search/playlists"), &[("q", query), ("limit", "6")])
+            .await?;
+        candidates.extend(
+            found["collection"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p["track_count"].as_u64().unwrap_or(1) > 0)
+                .filter_map(|p| Some((p["id"].as_u64()?, p["title"].as_str().unwrap_or(query).to_owned()))),
+        );
+        for (id, title) in candidates.into_iter().take(4) {
+            match self.playlist_tracks(id, limit).await {
+                Ok(tracks) if !tracks.is_empty() => return Ok(Some((title, tracks))),
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Tracks like `track`, as SoundCloud's own "related" list suggests them.
+    pub async fn related(&self, track: u64, limit: usize) -> Res<Vec<Track>> {
+        let limit = limit.to_string();
+        let value = self
+            .call(reqwest::Method::GET, &format!("{API}/tracks/{track}/related"), &[("limit", &limit)])
+            .await?;
+        let items: Vec<&Value> = value["collection"].as_array().into_iter().flatten().collect();
+        self.complete(&items).await
+    }
+
+    /// What is popular now: SoundCloud's trending chart, or for one genre the most played of
+    /// its tracks (`trending` narrows those to the last week). `all-music` means no genre.
+    /// The genre charts and the "top" chart answer 404 nowadays, so genres go through search.
+    pub async fn chart(&self, trending: bool, genre: &str, limit: usize) -> Res<Vec<Track>> {
+        let limit = limit.to_string();
+        if genre == "all-music" {
+            let value = self
+                .call(
+                    reqwest::Method::GET,
+                    &format!("{API}/charts"),
+                    &[("kind", "trending"), ("genre", "soundcloud:genres:all-music"), ("limit", &limit)],
+                )
+                .await?;
+            let items: Vec<&Value> = value["collection"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|item| if item["track"].is_object() { &item["track"] } else { item })
+                .collect();
+            return self.complete(&items).await;
+        }
+        let tag = match genre {
+            "jazzblues" => "jazz",
+            "danceedm" => "edm",
+            other => other,
+        };
+        let mut query = vec![("q", tag), ("filter.genre_or_tag", tag), ("limit", limit.as_str())];
+        query.push(if trending { ("filter.created_at", "last_week") } else { ("sort", "popular") });
+        let value = self.call(reqwest::Method::GET, &format!("{API}/search/tracks"), &query).await?;
+        let items: Vec<&Value> = value["collection"].as_array().into_iter().flatten().collect();
+        self.complete(&items).await
     }
 
     /// Asks SoundCloud for a playable URL in the best format this player can decode.

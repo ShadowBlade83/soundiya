@@ -83,6 +83,14 @@ async fn handle(
         "PLAY" if !argument.is_empty() => send(sender, Intent::Play(argument.to_owned())),
         "PLAY" => Err("missing search query".into()),
         "FAV" => send(sender, Intent::Favorites),
+        "PLAYLIST" if !argument.is_empty() => send(sender, Intent::Playlist(argument.to_owned())),
+        "PLAYLIST" => Err("missing playlist name".into()),
+        "TOP" | "TRENDING" => {
+            let genre = voice::genre_of(&argument.to_lowercase()).unwrap_or("all-music");
+            send(sender, Intent::Chart { trending: command.eq_ignore_ascii_case("TRENDING"), genre })
+        }
+        "RELATED" => send(sender, Intent::Related),
+        "NOW" => send(sender, Intent::NowPlaying),
         "PAUSE" => send(sender, Intent::Pause),
         "RESUME" => send(sender, Intent::Resume),
         "NEXT" => send(sender, Intent::Next),

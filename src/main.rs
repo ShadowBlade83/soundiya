@@ -43,6 +43,10 @@ soundiya - SoundCloud for Yandex Stations
   soundiya logout             forget the token, go back to anonymous mode
   soundiya play QUERY...      search SoundCloud and play
   soundiya fav                play your liked tracks (needs login)
+  soundiya playlist NAME      play a playlist or album (yours first when signed in)
+  soundiya top [GENRE]        the SoundCloud top chart; `trending [GENRE]` for the rising one
+  soundiya related            more tracks like the current one
+  soundiya now                Alice says which track plays
   soundiya pause | resume | next | prev
   soundiya volume 0-100
   soundiya status             what is playing now
@@ -110,6 +114,11 @@ fn main() -> ExitCode {
         "login" => login(&rest),
         "play" | "search" => command_line("PLAY", &rest),
         "fav" | "favorites" => command_line("FAV", ""),
+        "playlist" | "album" => command_line("PLAYLIST", &rest),
+        "top" => command_line("TOP", &rest),
+        "trending" => command_line("TRENDING", &rest),
+        "related" | "similar" => command_line("RELATED", ""),
+        "now" => command_line("NOW", ""),
         "pause" | "stop" => command_line("PAUSE", ""),
         "resume" => command_line("RESUME", ""),
         "next" => command_line("NEXT", ""),
@@ -251,13 +260,30 @@ enum Message {
         request: u64,
         tracks: Vec<Track>,
     },
-    /// A search or library request failed (or found nothing).
+    /// A search or library request failed (or found nothing). `say` is what Alice tells
+    /// the listener when the request came by voice.
     Failed {
         request: u64,
         error: String,
+        say: Option<String>,
     },
     /// The track of this generation could not be started.
     Unplayable(u64, String),
+}
+
+/// What to put in the queue besides a plain search.
+enum Fetch {
+    Playlist(String),
+    Chart { trending: bool, genre: &'static str },
+    Related(u64),
+}
+
+/// Alice's answer to a failed voice request, worded for her voice.
+fn nothing_found(from_voice: bool) -> Option<String> {
+    from_voice.then(|| "Ничего не нашла".to_owned())
+}
+fn unreachable_service(from_voice: bool) -> Option<String> {
+    from_voice.then(|| "Не получилось связаться с Саундклауд".to_owned())
 }
 
 struct App {
@@ -274,6 +300,8 @@ struct App {
     request: u64,
     failures: u32,
     last_query: Option<String>,
+    /// Alice may read answers aloud (`speech` in config.json, off by default).
+    speech: bool,
 }
 
 impl App {
@@ -372,10 +400,71 @@ impl App {
             let _ = voice::prepare_playback(native, from_voice).await;
             let message = match client.search(&query, QUEUE).await {
                 Ok(tracks) if !tracks.is_empty() => Message::Queue { request, tracks },
-                Ok(_) => Message::Failed { request, error: format!("nothing found for '{query}'") },
-                Err(e) => Message::Failed { request, error: e },
+                Ok(_) => Message::Failed {
+                    request,
+                    error: format!("nothing found for '{query}'"),
+                    say: nothing_found(from_voice),
+                },
+                Err(e) => Message::Failed { request, error: e, say: unreachable_service(from_voice) },
             };
             let _ = messages.send(message);
+        });
+    }
+
+    /// Replaces the queue with a playlist, a chart or tracks related to the current one.
+    fn load(&mut self, what: Fetch, from_voice: bool) {
+        self.request += 1;
+        let (request, client, native, messages) = (
+            self.request,
+            self.client.clone(),
+            self.native,
+            self.messages.clone(),
+        );
+        tokio::spawn(async move {
+            let _ = voice::prepare_playback(native, from_voice).await;
+            let found: Result<Vec<Track>, String> = match what {
+                Fetch::Playlist(name) => match client.playlist(&name, 100).await {
+                    Ok(Some((title, tracks))) => {
+                        eprintln!("playlist: {title} ({} tracks)", tracks.len());
+                        Ok(tracks)
+                    }
+                    // No such playlist: the words may still name a track or an artist.
+                    Ok(None) | Err(_) => client.search(&name, QUEUE).await,
+                },
+                Fetch::Chart { trending, genre } => match client.chart(trending, genre, 50).await {
+                    Ok(tracks) if !tracks.is_empty() || genre == "all-music" => Ok(tracks),
+                    _ => client.chart(trending, "all-music", 50).await,
+                },
+                Fetch::Related(track) => client.related(track, 50).await,
+            };
+            let message = match found {
+                Ok(tracks) if !tracks.is_empty() => Message::Queue { request, tracks },
+                Ok(_) => Message::Failed {
+                    request,
+                    error: "nothing found".into(),
+                    say: nothing_found(from_voice),
+                },
+                Err(e) => Message::Failed { request, error: e, say: unreachable_service(from_voice) },
+            };
+            let _ = messages.send(message);
+        });
+    }
+
+    /// Has Alice say `text`. Her own answer to a voice command was cancelled a moment ago,
+    /// and the repeated cancels (the last one about 1.5 s later) must be over before she
+    /// speaks, or the last one cuts the sentence short.
+    fn say(&self, text: String, from_voice: bool) {
+        let Some(address) = self.native.filter(|_| self.speech) else { return };
+        // Keeps the music guard from pausing the station's player (and her voice) meanwhile.
+        self.guard.hold(Duration::from_secs(20));
+        tokio::spawn(async move {
+            if from_voice {
+                tokio::time::sleep(voice::CANCELS_DONE).await;
+            }
+            match voice::say(address, &text).await {
+                Ok(()) => eprintln!("say: '{text}'"),
+                Err(e) => eprintln!("say: {e}"),
+            }
         });
     }
 
@@ -393,12 +482,18 @@ impl App {
                 Message::Failed {
                     request,
                     error: "liked tracks need a signed-in account: run 'soundiya login'".into(),
+                    say: from_voice
+                        .then(|| "Чтобы включить избранное, войдите в аккаунт Саундклауд".to_owned()),
                 }
             } else {
                 match client.liked_tracks(QUEUE).await {
                     Ok(tracks) if !tracks.is_empty() => Message::Queue { request, tracks },
-                    Ok(_) => Message::Failed { request, error: "no liked tracks yet".into() },
-                    Err(e) => Message::Failed { request, error: e },
+                    Ok(_) => Message::Failed {
+                        request,
+                        error: "no liked tracks yet".into(),
+                        say: from_voice.then(|| "В избранном пока пусто".to_owned()),
+                    },
+                    Err(e) => Message::Failed { request, error: e, say: unreachable_service(from_voice) },
                 }
             };
             let _ = messages.send(message);
@@ -418,6 +513,21 @@ impl App {
         match event.intent {
             Intent::Play(query) => self.search(query, from_voice),
             Intent::Favorites => self.favorites(from_voice),
+            Intent::Playlist(name) => self.load(Fetch::Playlist(name), from_voice),
+            Intent::Chart { trending, genre } => self.load(Fetch::Chart { trending, genre }, from_voice),
+            Intent::Related if self.active() => {
+                if let Some(track) = self.queue.get(self.index) {
+                    let id = track.id;
+                    self.load(Fetch::Related(id), from_voice);
+                }
+            }
+            Intent::NowPlaying if self.active() && self.speech => {
+                if let Some(track) = self.queue.get(self.index) {
+                    self.silence(from_voice);
+                    let (title, artist) = (voice::spoken(&track.title), voice::spoken(&track.artist));
+                    self.say(format!("Сейчас играет {title}, исполнитель {artist}"), from_voice);
+                }
+            }
             Intent::Pause if self.active() => {
                 self.silence(from_voice);
                 self.player.pause();
@@ -452,7 +562,7 @@ impl App {
                 }
             }
             // Not ours to handle: Alice answers by herself.
-            Intent::Pause | Intent::Next | Intent::Previous => {}
+            Intent::Pause | Intent::Next | Intent::Previous | Intent::Related | Intent::NowPlaying => {}
         }
     }
 
@@ -463,8 +573,11 @@ impl App {
                 self.queue = tracks;
                 self.start(0);
             }
-            Message::Failed { request, error } if request == self.request => {
-                eprintln!("search: {error}")
+            Message::Failed { request, error, say } if request == self.request => {
+                eprintln!("search: {error}");
+                if let Some(text) = say {
+                    self.say(text, true);
+                }
             }
             Message::Unplayable(generation, error) if generation == self.generation => {
                 self.fail_current(&error)
@@ -512,7 +625,7 @@ async fn daemon(options: Options) -> Result<(), String> {
     let (sender, mut receiver) = mpsc::channel::<voice::Event>(8);
     let voice_enabled = options.voice && config.voice && native.is_some();
     if voice_enabled && let Some(address) = native {
-        tokio::spawn(voice::watch(sender.clone(), ducking.clone(), address));
+        tokio::spawn(voice::watch(sender.clone(), ducking.clone(), guard.clone(), address));
     }
     if let Some(address) = native {
         let guard = guard.clone();
@@ -553,6 +666,7 @@ async fn daemon(options: Options) -> Result<(), String> {
         generation: 0,
         request: 0,
         failures: 0,
+        speech: config.speech,
         last_query: fs::read_to_string(options.state_dir.join("last-query"))
             .ok()
             .map(|s| s.trim().to_owned())

@@ -113,6 +113,9 @@ pub struct Config {
     pub voice: bool,
     /// Let the top (Alice) button pause and resume the music while it is loaded.
     pub buttons: bool,
+    /// Alice reads answers aloud ("what is playing"). Turn it off if her voice ever stops
+    /// working until a reboot.
+    pub speech: bool,
     pub bypass: Bypass,
 }
 impl Default for Config {
@@ -121,6 +124,7 @@ impl Default for Config {
             profile: "auto".into(),
             voice: true,
             buttons: true,
+            speech: true,
             bypass: Bypass::default(),
         }
     }
