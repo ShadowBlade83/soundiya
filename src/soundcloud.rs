@@ -449,7 +449,18 @@ pub fn clean_token(input: &str) -> Option<String> {
         let parts: Vec<&str> = piece.split('-').collect();
         parts.len() >= 4 && parts[..3].iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
     };
-    flat.split_whitespace().find(looks_like_token).map(str::to_owned)
+    // Newer web sessions carry a JWT (`eyJ...` header.payload.signature) instead.
+    let looks_like_jwt = |piece: &&str| {
+        let parts: Vec<&str> = piece.split('.').collect();
+        piece.starts_with("eyJ")
+            && piece.len() >= 40
+            && parts.len() == 3
+            && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+    };
+    flat.split_whitespace()
+        .find(looks_like_token)
+        .or_else(|| flat.split_whitespace().find(looks_like_jwt))
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -475,6 +486,17 @@ mod tests {
             assert_eq!(clean_token(&text).as_deref(), Some(token), "{text}");
         }
         assert_eq!(clean_token("hello world"), None);
+    }
+    #[test]
+    fn extracts_jwt_tokens() {
+        let jwt = "eyJraWQiOiJzYy16ZyIsImFsZyI6IlJTMjU2In0.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJlX3BhcnQ_-x";
+        for text in [jwt.to_owned(), format!("authorization: OAuth {jwt}"), format!("a=1; oauth_token={jwt}; b=2")] {
+            assert_eq!(clean_token(&text).as_deref(), Some(jwt), "{text}");
+        }
+        assert_eq!(clean_token("eyJhbGciOi.short"), None);
+        // The classic format still wins when both are present.
+        let classic = "2-293001-123456789-AbCdEfGhIjKlMn";
+        assert_eq!(clean_token(&format!("{jwt} {classic}")).as_deref(), Some(classic));
     }
     #[test]
     fn parses_tracks_with_mp3_transcodings() {

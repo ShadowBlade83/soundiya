@@ -225,7 +225,8 @@ fn command_line(command: &str, argument: &str) -> Result<(), String> {
 fn login(argument: &str) -> Result<(), String> {
     let mut text = argument.to_owned();
     if soundcloud::clean_token(&text).is_none() {
-        eprintln!("Paste the SoundCloud token (or the whole copied header/cURL), then press Enter:");
+        eprintln!("Paste the SoundCloud token (or the whole copied header/cURL), then press Enter.");
+        eprintln!("An empty line, Ctrl-D, q or exit cancels.");
         let mut line = String::new();
         // A multi-line cURL paste may need several lines before the token shows up.
         while soundcloud::clean_token(&text).is_none() && text.len() < 32 * 1024 {
@@ -233,11 +234,16 @@ fn login(argument: &str) -> Result<(), String> {
             if std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())? == 0 {
                 break;
             }
+            if matches!(line.trim(), "" | "q" | "quit" | "exit") {
+                break;
+            }
             text.push(' ');
             text.push_str(&line);
         }
     }
-    let token = soundcloud::clean_token(&text).ok_or("no SoundCloud token found in the text")?;
+    let token = soundcloud::clean_token(&text).ok_or(
+        "no SoundCloud token found: expected `2-…-…-…` (OAuth) or `eyJ…` (JWT) from the Authorization header",
+    )?;
     command_line("LOGIN", &token)
 }
 
