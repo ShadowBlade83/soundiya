@@ -442,11 +442,15 @@ impl App {
                 self.silence(from_voice);
                 self.start(self.index.saturating_sub(1));
             }
-            Intent::Toggle => match self.player.state() {
-                PLAYING => self.player.pause(),
-                PAUSED => self.player.resume(),
-                _ => {}
-            },
+            // The button also reaches Alice, who would complain about the missing Plus.
+            Intent::Toggle => {
+                self.silence(true);
+                match self.player.state() {
+                    PLAYING => self.player.pause(),
+                    PAUSED => self.player.resume(),
+                    _ => {}
+                }
+            }
             // Not ours to handle: Alice answers by herself.
             Intent::Pause | Intent::Next | Intent::Previous => {}
         }
@@ -517,7 +521,7 @@ async fn daemon(options: Options) -> Result<(), String> {
 
     let buttons_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if config.buttons && native.is_some() {
-        buttons::spawn(sender.clone(), mixer.clone(), buttons_active.clone());
+        buttons::spawn(sender.clone(), buttons_active.clone());
     }
 
     let context = Arc::new(control::Context {
