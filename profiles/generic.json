@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "id": "generic",
+  "name": "Generic ALSA",
+  "audio": {
+    "device": "default",
+    "format": "S16",
+    "mixer_device": "default",
+    "mixer_control": "Master",
+    "mixer_index": 0,
+    "mixer_channel": "front_left"
+  },
+  "voice": null,
+  "controls": null
+}

@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "id": "mini2",
+  "name": "Yandex Station Mini 2",
+  "audio": {
+    "device": "default",
+    "format": "S16",
+    "mixer_device": "default",
+    "mixer_control": "Master",
+    "mixer_index": 0,
+    "mixer_channel": "front_left"
+  },
+  "voice": {
+    "protocol": "quasar",
+    "address": "127.0.0.1:9875"
+  },
+  "controls": {
+    "driver": "mini2",
+    "input_device": "/dev/input/event0",
+    "input_name": "sar0_pad0",
+    "keys": { "alice": 582, "volume_up": 115, "volume_down": 114 },
+    "ring_prefix": "/sys/class/leds/mini2:",
+    "display_prefix": "/sys/class/leds/mini2:white:clock",
+    "ring_animations": "/system/vendor/quasar/ledpatterns/oknix",
+    "ring_colors": "/system/vendor/quasar/ledconfigs/blue.json",
+    "clock_animations": "/system/vendor/quasar/ledpatterns/clock"
+  }
+}

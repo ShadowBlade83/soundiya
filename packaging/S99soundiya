@@ -1,0 +1,18 @@
+#!/bin/sh
+DIR=/data/opt/soundiya
+case "${1:-}" in
+    start)
+        [ ! -x "$DIR/start.sh" ] || "$DIR/start.sh"
+        ;;
+    stop)
+        [ ! -x "$DIR/stop.sh" ] || "$DIR/stop.sh"
+        ;;
+    restart)
+        "$0" stop
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}" >&2
+        exit 1
+        ;;
+esac
