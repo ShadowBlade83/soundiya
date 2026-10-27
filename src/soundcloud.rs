@@ -324,17 +324,6 @@ impl Client {
         Ok(tracks.into_iter().flatten().collect())
     }
 
-    pub async fn like(&self, track: u64) -> Res<()> {
-        let user = self.me().await?;
-        self.call(
-            reqwest::Method::PUT,
-            &format!("{API}/users/{user}/track_likes/{track}"),
-            &[],
-        )
-        .await
-        .map(|_| ())
-    }
-
     /// Asks SoundCloud for a playable URL in the best format this player can decode.
     pub async fn stream(&self, track: &Track) -> Res<Stream> {
         let mut choices: Vec<(u32, Codec, &Transcoding)> = track

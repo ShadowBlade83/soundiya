@@ -5,6 +5,7 @@ mod control;
 mod diagnose;
 mod ducking;
 mod fmp4;
+mod buttons;
 mod mixer;
 mod player;
 mod rawfake;
@@ -42,7 +43,6 @@ soundiya - SoundCloud for Yandex Stations
   soundiya logout             forget the token, go back to anonymous mode
   soundiya play QUERY...      search SoundCloud and play
   soundiya fav                play your liked tracks (needs login)
-  soundiya like               like the current track (needs login)
   soundiya pause | resume | next | prev
   soundiya volume 0-100
   soundiya status             what is playing now
@@ -110,7 +110,6 @@ fn main() -> ExitCode {
         "login" => login(&rest),
         "play" | "search" => command_line("PLAY", &rest),
         "fav" | "favorites" => command_line("FAV", ""),
-        "like" => command_line("LIKE", ""),
         "pause" | "stop" => command_line("PAUSE", ""),
         "resume" => command_line("RESUME", ""),
         "next" => command_line("NEXT", ""),
@@ -419,24 +418,6 @@ impl App {
         match event.intent {
             Intent::Play(query) => self.search(query, from_voice),
             Intent::Favorites => self.favorites(from_voice),
-            Intent::Like => {
-                // Always silence Alice, even when there is nothing to like.
-                self.silence(from_voice);
-                let Some(track) = self.queue.get(self.index).filter(|_| self.active()).cloned()
-                else {
-                    return eprintln!("like: nothing is playing");
-                };
-                if !self.client.logged_in() {
-                    return eprintln!("like: sign in first with 'soundiya login'");
-                }
-                let client = self.client.clone();
-                tokio::spawn(async move {
-                    match client.like(track.id).await {
-                        Ok(()) => eprintln!("like: added to favorites ({})", track.label()),
-                        Err(e) => eprintln!("like: failed: {e}"),
-                    }
-                });
-            }
             Intent::Pause if self.active() => {
                 self.silence(from_voice);
                 self.player.pause();
@@ -461,6 +442,11 @@ impl App {
                 self.silence(from_voice);
                 self.start(self.index.saturating_sub(1));
             }
+            Intent::Toggle => match self.player.state() {
+                PLAYING => self.player.pause(),
+                PAUSED => self.player.resume(),
+                _ => {}
+            },
             // Not ours to handle: Alice answers by herself.
             Intent::Pause | Intent::Next | Intent::Previous => {}
         }
@@ -529,6 +515,11 @@ async fn daemon(options: Options) -> Result<(), String> {
         tokio::spawn(async move { guard.run(address).await });
     }
 
+    let buttons_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if config.buttons && native.is_some() {
+        buttons::spawn(sender.clone(), mixer.clone(), buttons_active.clone());
+    }
+
     let context = Arc::new(control::Context {
         client: client.clone(),
         status: Mutex::new(String::new()),
@@ -582,6 +573,7 @@ async fn daemon(options: Options) -> Result<(), String> {
             _ = tick.tick() => {
                 let state = app.player.state();
                 app.guard.set_playing(state == PLAYING);
+                buttons_active.store(app.active(), Ordering::Release);
                 mixer.follow(state != IDLE || app.active());
                 *context.status.lock().unwrap() = app.status();
             }
@@ -671,7 +663,7 @@ async fn check(options: Options) -> Result<(), String> {
     if client.logged_in() {
         println!("5. account: {}", client.username().await.unwrap_or_else(|e| format!("FAILED - {e}")));
     } else {
-        println!("5. account: anonymous mode (run 'soundiya login' for likes and favorites)");
+        println!("5. account: anonymous mode (run 'soundiya login' for your favorites)");
     }
     Ok(())
 }

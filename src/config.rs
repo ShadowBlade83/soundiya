@@ -111,6 +111,8 @@ impl Default for Bypass {
 pub struct Config {
     pub profile: String,
     pub voice: bool,
+    /// Let the top (Alice) button pause and resume the music while it is loaded.
+    pub buttons: bool,
     pub bypass: Bypass,
 }
 impl Default for Config {
@@ -118,6 +120,7 @@ impl Default for Config {
         Self {
             profile: "auto".into(),
             voice: true,
+            buttons: true,
             bypass: Bypass::default(),
         }
     }

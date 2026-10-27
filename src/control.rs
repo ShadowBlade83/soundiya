@@ -87,7 +87,6 @@ async fn handle(
         "RESUME" => send(sender, Intent::Resume),
         "NEXT" => send(sender, Intent::Next),
         "PREV" => send(sender, Intent::Previous),
-        "LIKE" => send(sender, Intent::Like),
         "VOLUME" => {
             let percent: u16 = argument.parse().map_err(|_| "volume is 0-100".to_owned())?;
             if percent > 100 {

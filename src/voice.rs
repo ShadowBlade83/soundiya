@@ -17,7 +17,8 @@ pub enum Intent {
     Pause,
     Next,
     Previous,
-    Like,
+    /// The Alice button: pause what plays, resume what is paused.
+    Toggle,
 }
 pub struct Event {
     pub intent: Intent,
@@ -66,16 +67,13 @@ pub fn intent(text: &str) -> Option<Intent> {
         | "любимые треки" => {
             return Some(Intent::Favorites);
         }
-        "лайк"
-        | "поставь лайк"
-        | "добавь в избранное"
-        | "сохрани песню"
-        | "мне нравится" => {
-            return Some(Intent::Like);
+        // Likes cannot be written from the speaker; do not search for a track named "лайк".
+        "лайк" | "поставь лайк" | "добавь в избранное" | "сохрани песню" | "мне нравится" => {
+            return None;
         }
         _ => {}
     }
-    let rest = ["включи ", "поставь ", "запусти ", "сыграй "]
+    let rest =["включи ", "поставь ", "запусти ", "сыграй "]
         .iter()
         .find_map(|p| text.strip_prefix(p))?
         .trim();
@@ -494,7 +492,9 @@ mod tests {
         assert_eq!(intent("Алиса выключи"), Some(Intent::Pause));
         assert_eq!(intent("Включи музыку"), Some(Intent::Resume));
         assert_eq!(intent("следующий трек"), Some(Intent::Next));
-        assert_eq!(intent("Поставь лайк"), Some(Intent::Like));
+        // SoundCloud's bot protection blocks likes from the speaker, so they are left to Alice.
+        assert_eq!(intent("Поставь лайк"), None);
+        assert_eq!(intent("лайк"), None);
         assert_eq!(intent("включи избранное"), Some(Intent::Favorites));
         for s in [
             "включи свет",
