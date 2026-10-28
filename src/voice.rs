@@ -84,6 +84,7 @@ const NEXT: &[&str] = &[
 const PREVIOUS: &[&str] = &[
     "назад", "предыдущий", "предыдущая", "предыдущую", "предыдущий трек", "предыдущая песня",
     "предыдущую песню", "прошлая песня", "прошлую песню", "прошлый трек", "вернись", "верни предыдущую",
+    "обратно", "обратно назад", "обратно назад песню", "назад песню", "назад трек", "вернуть назад",
     "верни предыдущий", "включи предыдущий", "включи предыдущую", "включи прошлую", "поставь предыдущую",
 ];
 const RESUME: &[&str] = &[
@@ -94,6 +95,8 @@ const RESUME: &[&str] = &[
 const FAVORITES: &[&str] = &[
     "избранное", "любимое", "любимые", "любимые треки", "любимую музыку", "мою музыку", "мою любимую музыку",
     "мои лайки", "мои треки", "мои песни", "лайкнутое", "то что мне нравится", "моя музыка",
+    // Yandex's name for liked tracks; said without a verb it stays a like, which Alice handles.
+    "мне нравится",
 ];
 const RELATED: &[&str] = &[
     "похожее", "похожие", "похожую музыку", "похожие треки", "похожие песни", "что нибудь похожее",
@@ -195,6 +198,10 @@ fn seek(text: &str) -> Option<Intent> {
     let has = |prefix: &str| words.iter().any(|w| w.starts_with(prefix));
     if words.len() <= 4 && (text.contains("с начала") || has("сначала") || has("заново") || text.contains("в начало")) {
         return Some(Intent::Restart);
+    }
+    // A bare "вперёд" is a short skip ahead, like a bare "назад" is the previous track.
+    if words == ["вперед"] {
+        return Some(Intent::Seek(30));
     }
     let verb = ["перемот", "промот", "отмот", "мотни", "мотай", "прокрут", "перекрут"].iter().any(|p| has(p));
     let back = has("назад") || has("отмот");
@@ -814,6 +821,11 @@ mod tests {
         assert_eq!(intent("с начала"), Some(Intent::Restart));
         assert_eq!(intent("назад"), Some(Intent::Previous));
         assert_eq!(intent("включи назад"), Some(Intent::Previous));
+        assert_eq!(intent("Вперёд"), Some(Intent::Seek(30)));
+        assert_eq!(intent("Обратно назад песню"), Some(Intent::Previous));
+        assert_eq!(intent("Включи мне нравится"), Some(Intent::Favorites));
+        // Said alone, "мне нравится" is a like, which stays with Alice.
+        assert_eq!(intent("Мне нравится"), None);
         for said in ["поставь на повтор", "Алиса, включи эту песню на повтор", "зациклить песню", "повторяй эту песню бесконечно", "включи повтор"] {
             assert_eq!(intent(said), Some(Intent::Loop(true)), "{said}");
         }
