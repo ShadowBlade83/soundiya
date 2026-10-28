@@ -209,15 +209,20 @@ impl Client {
     ) -> Res<Value> {
         let token = self.oauth.lock().unwrap().clone();
         let mut last = String::new();
-        for attempt in 0..2 {
+        // The last attempt goes without the login: a rejected (for instance expired JWT, they
+        // last a day) token must not break searching, which works anonymously.
+        let attempts = if token.is_some() && method == reqwest::Method::GET { 3 } else { 2 };
+        for attempt in 0..attempts {
             let id = self.client_id(attempt > 0 && last.contains("HTTP 401")).await?;
             let mut request = self
                 .api
                 .request(method.clone(), url)
                 .query(&[("client_id", id.as_str())])
                 .query(params);
-            if let Some(token) = &token {
+            if let Some(token) = token.as_ref().filter(|_| attempt < 2) {
                 request = request.header("Authorization", format!("OAuth {token}"));
+            } else if token.is_some() {
+                eprintln!("soundcloud: the login was rejected (expired?), trying anonymously; run 'soundiya login' again");
             }
             let response = match request.send().await {
                 Ok(r) => r,

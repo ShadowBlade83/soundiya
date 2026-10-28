@@ -54,7 +54,10 @@ pub struct Shared {
 }
 
 enum Command {
-    Play(u64, ChannelSource),
+    /// Generation, source, and how much of the start to skip (ms).
+    Play(u64, ChannelSource, u64),
+    /// Skip this much further into the current track (ms).
+    Skip(u64),
     Pause,
     Resume,
     Stop,
@@ -95,8 +98,13 @@ impl Player {
     pub fn open(&self, generation: u64, http: reqwest::Client, stream: Stream) -> ChannelSource {
         spawn_fetch(http, stream, generation, self.shared.clone())
     }
-    pub fn play(&self, generation: u64, source: ChannelSource) {
-        let _ = self.commands.send(Command::Play(generation, source));
+    /// Plays `source`, silently skipping its first `from_ms` milliseconds.
+    pub fn play_from(&self, generation: u64, source: ChannelSource, from_ms: u64) {
+        let _ = self.commands.send(Command::Play(generation, source, from_ms));
+    }
+    /// Jumps forward in the current track by decoding and dropping `ms` of audio.
+    pub fn skip(&self, ms: u64) {
+        let _ = self.commands.send(Command::Skip(ms));
     }
     pub fn pause(&self) {
         let _ = self.commands.send(Command::Pause);
@@ -310,6 +318,12 @@ pub async fn probe(http: reqwest::Client, stream: Stream) -> Result<(u32, usize)
     .map_err(|e| e.to_string())?
 }
 
+/// Duration of `frames` audio frames at `rate`, in microseconds (exact enough not to drift
+/// over a long skip, unlike whole milliseconds per 23 ms AAC frame).
+fn frames_to_us(frames: u64, rate: u32) -> u64 {
+    frames * 1_000_000 / u64::from(rate.max(1))
+}
+
 /// Folds any channel layout down to interleaved stereo.
 fn to_stereo(samples: &[i16], channels: usize, out: &mut Vec<i16>) {
     out.clear();
@@ -499,7 +513,7 @@ impl Demux {
 enum Outcome {
     Ended,
     Stopped,
-    Replace(u64, ChannelSource),
+    Replace(u64, ChannelSource, u64),
 }
 struct Worker {
     receiver: std_mpsc::Receiver<Command>,
@@ -512,22 +526,24 @@ impl Worker {
     fn run(self) {
         let mut next = None;
         loop {
-            let (generation, source) = match next.take() {
+            let (generation, source, from_ms) = match next.take() {
                 Some(job) => job,
                 None => match self.receiver.recv() {
-                    Ok(Command::Play(generation, source)) => (generation, source),
+                    Ok(Command::Play(generation, source, from_ms)) => (generation, source, from_ms),
                     Ok(_) => continue,
                     Err(_) => return,
                 },
             };
-            let result = self.track(generation, source);
+            let result = self.track(generation, source, from_ms);
             self.shared.state.store(IDLE, Ordering::Release);
             match result {
                 Ok(Outcome::Ended) => {
                     let _ = self.events.send(Event::Ended(generation));
                 }
                 Ok(Outcome::Stopped) => {}
-                Ok(Outcome::Replace(generation, source)) => next = Some((generation, source)),
+                Ok(Outcome::Replace(generation, source, from_ms)) => {
+                    next = Some((generation, source, from_ms));
+                }
                 // Whatever went wrong after the track was replaced is not an error.
                 Err(_) if self.shared.generation.load(Ordering::Acquire) != generation => {}
                 Err(e) => {
@@ -538,7 +554,7 @@ impl Worker {
     }
 
     /// Waits out a pause; returns what to do next if playback does not simply continue.
-    fn paused(&self, output: &Option<Output>) -> Option<Outcome> {
+    fn paused(&self, output: &Option<Output>, skip_us: &mut u64) -> Option<Outcome> {
         if let Some(out) = output {
             let _ = out.pcm.drop();
         }
@@ -552,15 +568,20 @@ impl Worker {
                     self.shared.state.store(PLAYING, Ordering::Release);
                     return None;
                 }
-                Ok(Command::Play(g, s)) => return Some(Outcome::Replace(g, s)),
+                Ok(Command::Play(g, s, from)) => return Some(Outcome::Replace(g, s, from)),
+                Ok(Command::Skip(ms)) => *skip_us += ms * 1000,
                 Ok(Command::Stop) | Err(_) => return Some(Outcome::Stopped),
                 Ok(Command::Pause) => {}
             }
         }
     }
 
-    fn track(&self, generation: u64, source: ChannelSource) -> Result<Outcome, String> {
+    fn track(&self, generation: u64, source: ChannelSource, from_ms: u64) -> Result<Outcome, String> {
         let (mut demux, mut decoder) = Demux::open(source)?;
+        // Audio still to drop before playing (a seek), and audio dropped so far, in µs.
+        let mut skip_us = from_ms * 1000;
+        let mut skipped_us: u64 = 0;
+        self.shared.position_ms.store(from_ms, Ordering::Relaxed);
         let mut output: Option<Output> = None;
         let mut gain = Gain::new();
         let mut stereo: Vec<i16> = Vec::new();
@@ -569,9 +590,10 @@ impl Worker {
         loop {
             match self.receiver.try_recv() {
                 Ok(Command::Stop) => return Ok(Outcome::Stopped),
-                Ok(Command::Play(g, s)) => return Ok(Outcome::Replace(g, s)),
+                Ok(Command::Play(g, s, from)) => return Ok(Outcome::Replace(g, s, from)),
+                Ok(Command::Skip(ms)) => skip_us += ms * 1000,
                 Ok(Command::Pause) => {
-                    if let Some(outcome) = self.paused(&output) {
+                    if let Some(outcome) = self.paused(&output, &mut skip_us) {
                         return Ok(outcome);
                     }
                 }
@@ -587,6 +609,14 @@ impl Worker {
                 Err(e) => return Err(format!("decode: {e}")),
             };
             let spec = *decoded.spec();
+            if skip_us > 0 {
+                let us = frames_to_us(decoded.frames() as u64, spec.rate);
+                skip_us = skip_us.saturating_sub(us);
+                skipped_us += us;
+                let played_ms = output.as_ref().map_or(0, |o| o.frames * 1000 / u64::from(o.rate));
+                self.shared.position_ms.store(skipped_us / 1000 + played_ms, Ordering::Relaxed);
+                continue;
+            }
             let buffer =
                 samples.get_or_insert_with(|| SampleBuffer::new(decoded.capacity() as u64, spec));
             buffer.copy_interleaved_ref(decoded);
@@ -608,9 +638,10 @@ impl Worker {
             if self.shared.state.swap(PLAYING, Ordering::AcqRel) == IDLE {
                 let _ = self.events.send(Event::Started(generation));
             }
-            self.shared
-                .position_ms
-                .store(out.frames * 1000 / u64::from(out.rate), Ordering::Relaxed);
+            self.shared.position_ms.store(
+                skipped_us / 1000 + out.frames * 1000 / u64::from(out.rate),
+                Ordering::Relaxed,
+            );
         }
         if let Some(out) = &output {
             let _ = out.pcm.drain();
@@ -632,6 +663,15 @@ mod tests {
             ["https://cdn/base/data000.m4s?sig=1", "https://cdn/x/data001.m4s"]
         );
         assert_eq!(playlist_parts("#EXTM3U\nseg.mp3\n", "b/").0, None);
+    }
+    #[test]
+    fn skip_durations_do_not_drift() {
+        assert_eq!(frames_to_us(44_100, 44_100), 1_000_000);
+        // 20 s of AAC frames (1024 samples) adds up to 20 s within one frame.
+        let frames = 20 * 44_100 / 1024;
+        let total: u64 = (0..frames).map(|_| frames_to_us(1024, 44_100)).sum();
+        assert!(20_000_000 - total < 24_000, "{total}");
+        assert_eq!(frames_to_us(1, 0), 1_000_000);
     }
     #[test]
     fn channel_layouts_become_stereo() {

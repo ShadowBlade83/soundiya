@@ -95,6 +95,19 @@ async fn handle(
         "RESUME" => send(sender, Intent::Resume),
         "NEXT" => send(sender, Intent::Next),
         "PREV" => send(sender, Intent::Previous),
+        "SEEK" => {
+            let seconds: i32 = argument.parse().map_err(|_| "seek takes seconds: 20 or -10".to_owned())?;
+            if seconds == 0 || seconds.unsigned_abs() > 3600 {
+                return Err("seek takes seconds: 20 or -10 (up to an hour)".into());
+            }
+            send(sender, Intent::Seek(seconds))
+        }
+        "RESTART" => send(sender, Intent::Restart),
+        "REPEAT" => match argument.to_ascii_lowercase().as_str() {
+            "" | "on" => send(sender, Intent::Loop(true)),
+            "off" => send(sender, Intent::Loop(false)),
+            _ => Err("repeat takes on or off".into()),
+        },
         "VOLUME" => {
             let percent: u16 = argument.parse().map_err(|_| "volume is 0-100".to_owned())?;
             if percent > 100 {

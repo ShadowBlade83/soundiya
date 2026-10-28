@@ -29,6 +29,12 @@ pub enum Intent {
     Toggle,
     /// The phrase names Yandex ("... на Яндекс Музыке"): Alice plays it herself.
     Handover,
+    /// Seek within the current track by this many seconds (negative: back).
+    Seek(i32),
+    /// Play the current track from the beginning.
+    Restart,
+    /// Repeat the current track endlessly (`true`) or stop doing so.
+    Loop(bool),
 }
 pub struct Event {
     pub intent: Intent,
@@ -121,6 +127,109 @@ pub fn genre_of(text: &str) -> Option<&'static str> {
         .map(|(_, id)| *id)
 }
 
+/// Seconds in a spoken duration: "20 секунд", "двадцать пять секунд", "минуту", "полторы минуты",
+/// "1 минуту 30 секунд". A number without a unit counts as seconds.
+fn duration(words: &[&str]) -> Option<u32> {
+    fn number(word: &str) -> Option<f64> {
+        if let Ok(n) = word.parse::<u32>() {
+            return Some(f64::from(n));
+        }
+        Some(match word {
+            "ноль" => 0.0,
+            "один" | "одна" | "одну" => 1.0,
+            "два" | "две" | "пару" => 2.0,
+            "три" => 3.0,
+            "четыре" => 4.0,
+            "пять" => 5.0,
+            "шесть" => 6.0,
+            "семь" => 7.0,
+            "восемь" => 8.0,
+            "девять" => 9.0,
+            "десять" => 10.0,
+            "одиннадцать" => 11.0,
+            "двенадцать" => 12.0,
+            "тринадцать" => 13.0,
+            "четырнадцать" => 14.0,
+            "пятнадцать" => 15.0,
+            "шестнадцать" => 16.0,
+            "семнадцать" => 17.0,
+            "восемнадцать" => 18.0,
+            "девятнадцать" => 19.0,
+            "двадцать" => 20.0,
+            "тридцать" => 30.0,
+            "сорок" => 40.0,
+            "пятьдесят" => 50.0,
+            "шестьдесят" => 60.0,
+            "семьдесят" => 70.0,
+            "восемьдесят" => 80.0,
+            "девяносто" => 90.0,
+            "полторы" | "полтора" => 1.5,
+            "пол" => 0.5,
+            _ => return None,
+        })
+    }
+    let mut total = 0.0;
+    let mut pending: Option<f64> = None;
+    for word in words {
+        if let Some(n) = number(word) {
+            // "двадцать пять": tens followed by units add up.
+            pending = Some(match pending {
+                Some(p) if p >= 20.0 && p % 10.0 == 0.0 && n < 10.0 => p + n,
+                _ => n,
+            });
+        } else if word.starts_with("полминут") {
+            total += 30.0;
+        } else if word.starts_with("сек") {
+            total += pending.take().unwrap_or(1.0);
+        } else if word.starts_with("мин") {
+            total += pending.take().unwrap_or(1.0) * 60.0;
+        }
+    }
+    total += pending.unwrap_or(0.0);
+    (total > 0.0).then(|| total.min(3600.0) as u32)
+}
+
+/// "перемотай на 20 секунд вперед", "назад на 10 секунд", "с начала".
+fn seek(text: &str) -> Option<Intent> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let has = |prefix: &str| words.iter().any(|w| w.starts_with(prefix));
+    if words.len() <= 4 && (text.contains("с начала") || has("сначала") || has("заново") || text.contains("в начало")) {
+        return Some(Intent::Restart);
+    }
+    let verb = ["перемот", "промот", "отмот", "мотни", "мотай", "прокрут", "перекрут"].iter().any(|p| has(p));
+    let back = has("назад") || has("отмот");
+    let amount = duration(&words);
+    // A bare "назад" is the previous track; it needs a duration to become a seek.
+    if !verb && !(amount.is_some() && (back || has("вперед"))) {
+        return None;
+    }
+    let seconds = i32::try_from(amount.unwrap_or(30)).unwrap_or(30);
+    Some(Intent::Seek(if back { -seconds } else { seconds }))
+}
+
+/// "поставь на повтор", "зациклить песню", "выключи повтор", "повтори эту песню".
+fn repeat(text: &str) -> Option<Intent> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() > 8 || words.first().is_some_and(|w| ["почему", "зачем", "как", "что", "кто", "когда", "где"].contains(w)) {
+        return None;
+    }
+    let has = |prefix: &str| words.iter().any(|w| w.starts_with(prefix));
+    // "повтори" alone asks Alice to say her last sentence again; "повтори эту песню" plays it again.
+    if words.first() == Some(&"повтори") && (has("песн") || has("трек") || has("композиц")) {
+        return Some(Intent::Restart);
+    }
+    let subject = words.iter().any(|w| matches!(*w, "повтор" | "повтора" | "повторе" | "повторять" | "повторяй" | "повторяет"))
+        || has("зацикл")
+        || has("бесконечн");
+    if !subject {
+        return None;
+    }
+    let off = ["выключи", "отключи", "убери", "отмени", "без", "не", "хватит", "прекрати", "останови"]
+        .iter()
+        .any(|p| words.contains(p));
+    Some(Intent::Loop(!off))
+}
+
 fn now_playing(text: &str) -> bool {
     let words: Vec<&str> = text.split_whitespace().collect();
     let has = |part: &str| words.iter().any(|w| w.starts_with(part));
@@ -153,6 +262,9 @@ pub fn intent(text: &str) -> Option<Intent> {
     // "включи Сплин на Яндекс Музыке", "Яндекс музыка, включи ...": leave it to Alice.
     if text.split_whitespace().any(|w| w.starts_with("яндекс")) {
         return Some(Intent::Handover);
+    }
+    if let Some(intent) = seek(&text).or_else(|| repeat(&text)) {
+        return Some(intent);
     }
     // Longest verbs first, so "хочу послушать" is not read as "послушать".
     let mut verbs = VERBS.to_vec();
@@ -688,6 +800,30 @@ mod tests {
         assert_eq!(intent("Алиса, включи Сплин на Яндекс Музыке"), Some(Intent::Handover));
         assert_eq!(intent("Яндекс музыка включи сплин"), Some(Intent::Handover));
         assert_eq!(intent("включи сплин в яндексе"), Some(Intent::Handover));
+        assert_eq!(intent("Перемотай на 20 секунд вперёд"), Some(Intent::Seek(20)));
+        assert_eq!(intent("перемотай вперед"), Some(Intent::Seek(30)));
+        assert_eq!(intent("Алиса, отмотай назад на десять секунд"), Some(Intent::Seek(-10)));
+        assert_eq!(intent("назад на 15 секунд"), Some(Intent::Seek(-15)));
+        assert_eq!(intent("вперед на минуту"), Some(Intent::Seek(60)));
+        assert_eq!(intent("промотай на полторы минуты"), Some(Intent::Seek(90)));
+        assert_eq!(intent("перемотай на двадцать пять секунд"), Some(Intent::Seek(25)));
+        assert_eq!(intent("перемотай на 1 минуту 30 секунд вперед"), Some(Intent::Seek(90)));
+        assert_eq!(intent("перемотай на полминуты назад"), Some(Intent::Seek(-30)));
+        assert_eq!(intent("перемотай на пол минуты вперед"), Some(Intent::Seek(30)));
+        assert_eq!(intent("включи сначала"), Some(Intent::Restart));
+        assert_eq!(intent("с начала"), Some(Intent::Restart));
+        assert_eq!(intent("назад"), Some(Intent::Previous));
+        assert_eq!(intent("включи назад"), Some(Intent::Previous));
+        for said in ["поставь на повтор", "Алиса, включи эту песню на повтор", "зациклить песню", "повторяй эту песню бесконечно", "включи повтор"] {
+            assert_eq!(intent(said), Some(Intent::Loop(true)), "{said}");
+        }
+        for said in ["выключи повтор", "хватит повторять", "не повторяй песню", "поставь без повтора", "отключи бесконечный повтор"] {
+            assert_eq!(intent(said), Some(Intent::Loop(false)), "{said}");
+        }
+        assert_eq!(intent("повтори эту песню"), Some(Intent::Restart));
+        // Alice repeats her own sentences, and questions about repeats are hers too.
+        assert_eq!(intent("повтори"), None);
+        assert_eq!(intent("что такое повтор"), None);
         assert_eq!(intent("включи избранное"), Some(Intent::Favorites));
         for s in [
             "включи свет",

@@ -49,6 +49,9 @@ soundiya - SoundCloud for Yandex Stations
   soundiya related            more tracks like the current one
   soundiya now                Alice says which track plays
   soundiya pause | resume | next | prev
+  soundiya seek SECONDS       jump within the track: seek 20, seek -10
+  soundiya restart            play the current track from the beginning
+  soundiya repeat [on|off]    repeat the current track endlessly
   soundiya volume 0-100
   soundiya status             what is playing now
   soundiya check              test SoundCloud access and the DPI bypass
@@ -124,6 +127,9 @@ fn main() -> ExitCode {
         "resume" => command_line("RESUME", ""),
         "next" => command_line("NEXT", ""),
         "prev" | "previous" => command_line("PREV", ""),
+        "seek" => command_line("SEEK", &rest),
+        "restart" => command_line("RESTART", ""),
+        "repeat" => command_line("REPEAT", &rest),
         "volume" => command_line("VOLUME", &rest),
         "status" => command_line("STATUS", ""),
         "logout" => command_line("LOGOUT", ""),
@@ -314,6 +320,8 @@ struct App {
     /// The last voice request went to Yandex Music: control phrases belong to Alice until
     /// the next search.
     handed_over: bool,
+    /// The current track starts again when it ends; cleared when a new queue is loaded.
+    repeat: bool,
 }
 
 impl App {
@@ -335,13 +343,14 @@ impl App {
         let position = self.player.shared.position_ms.load(Ordering::Relaxed) / 1000;
         let length = self.queue.get(self.index).map_or(0, |t| t.duration_ms / 1000);
         format!(
-            "{state}: {track} [{}:{:02} / {}:{:02}] queue {}/{} | account: {}",
+            "{state}: {track} [{}:{:02} / {}:{:02}] queue {}/{}{} | account: {}",
             position / 60,
             position % 60,
             length / 60,
             length % 60,
             if self.active() { self.index + 1 } else { 0 },
             self.queue.len(),
+            if self.repeat { " repeat" } else { "" },
             if self.client.logged_in() { "signed in" } else { "anonymous" },
         )
     }
@@ -352,6 +361,10 @@ impl App {
     }
 
     fn start(&mut self, index: usize) {
+        self.start_at(index, 0);
+    }
+    /// Starts track `index`, skipping its first `from_ms` milliseconds (a backward seek).
+    fn start_at(&mut self, index: usize, from_ms: u64) {
         let Some(track) = self.queue.get(index).cloned() else {
             return self.stop();
         };
@@ -368,7 +381,7 @@ impl App {
             match client.stream(&track).await {
                 Ok(stream) if player.is_current(generation) => {
                     let source = player.open(generation, client.media_http(), stream);
-                    player.play(generation, source);
+                    player.play_from(generation, source, from_ms);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -537,6 +550,9 @@ impl App {
                     | Intent::Related
                     | Intent::NowPlaying
                     | Intent::Toggle
+                    | Intent::Seek(_)
+                    | Intent::Restart
+                    | Intent::Loop(_)
                     | Intent::Handover => return,
                     _ => self.handed_over = false,
                 }
@@ -596,6 +612,30 @@ impl App {
                 self.silence(from_voice);
                 self.start(self.index.saturating_sub(1));
             }
+            Intent::Seek(seconds) if self.active() => {
+                self.silence(from_voice);
+                let delta = u64::from(seconds.unsigned_abs()) * 1000;
+                if seconds > 0 {
+                    eprintln!("player: seek +{seconds} s");
+                    self.player.skip(delta);
+                } else {
+                    // The stream only reads forward: back means the same track again, from earlier.
+                    let position = self.player.shared.position_ms.load(Ordering::Relaxed);
+                    eprintln!("player: seek {seconds} s");
+                    self.start_at(self.index, position.saturating_sub(delta));
+                }
+            }
+            Intent::Restart if self.active() => {
+                self.silence(from_voice);
+                self.start_at(self.index, 0);
+            }
+            Intent::Loop(on) if self.active() || !on => {
+                self.silence(from_voice);
+                self.repeat = on && self.active();
+                eprintln!("player: repeat {}", if self.repeat { "on" } else { "off" });
+                let words = if self.repeat { "Повторяю этот трек" } else { "Повтор выключен" };
+                self.say(words.to_owned(), from_voice);
+            }
             // The button also reaches Alice, who would complain about the missing Plus.
             Intent::Toggle => {
                 self.silence(true);
@@ -606,7 +646,14 @@ impl App {
                 }
             }
             // Not ours to handle: Alice answers by herself.
-            Intent::Pause | Intent::Next | Intent::Previous | Intent::Related | Intent::NowPlaying => {}
+            Intent::Pause
+            | Intent::Next
+            | Intent::Previous
+            | Intent::Related
+            | Intent::NowPlaying
+            | Intent::Seek(_)
+            | Intent::Restart
+            | Intent::Loop(_) => {}
         }
     }
 
@@ -614,6 +661,7 @@ impl App {
         match message {
             Message::Queue { request, tracks } if request == self.request => {
                 self.failures = 0;
+                self.repeat = false;
                 self.queue = tracks;
                 self.start(0);
             }
@@ -633,6 +681,8 @@ impl App {
     fn player_event(&mut self, event: PlayerEvent) {
         match event {
             PlayerEvent::Started(g) if g == self.generation => self.failures = 0,
+            // On repeat the same track starts again instead of the next one.
+            PlayerEvent::Ended(g) if g == self.generation && self.repeat => self.start_at(self.index, 0),
             PlayerEvent::Ended(g) if g == self.generation => self.advance(),
             PlayerEvent::Failed(g, error) if g == self.generation => self.fail_current(&error),
             _ => {}
@@ -712,6 +762,7 @@ async fn daemon(options: Options) -> Result<(), String> {
         failures: 0,
         speech: config.speech,
         handed_over: false,
+        repeat: false,
         last_query: fs::read_to_string(options.state_dir.join("last-query"))
             .ok()
             .map(|s| s.trim().to_owned())
