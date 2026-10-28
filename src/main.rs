@@ -309,8 +309,11 @@ struct App {
     request: u64,
     failures: u32,
     last_query: Option<String>,
-    /// Alice may read answers aloud (`speech` in config.json, off by default).
+    /// Alice may read answers aloud (`speech` in config.json, on by default).
     speech: bool,
+    /// The last voice request went to Yandex Music: control phrases belong to Alice until
+    /// the next search.
+    handed_over: bool,
 }
 
 impl App {
@@ -523,7 +526,34 @@ impl App {
 
     fn intent(&mut self, event: voice::Event) {
         let from_voice = event.from_voice;
+        if self.handed_over {
+            if from_voice || matches!(event.intent, Intent::Toggle) {
+                match event.intent {
+                    // Alice's own player is in charge: no pause, no cancel of her answer.
+                    Intent::Pause
+                    | Intent::Resume
+                    | Intent::Next
+                    | Intent::Previous
+                    | Intent::Related
+                    | Intent::NowPlaying
+                    | Intent::Toggle
+                    | Intent::Handover => return,
+                    _ => self.handed_over = false,
+                }
+            } else {
+                // A console command takes control back.
+                self.handed_over = false;
+            }
+        }
         match event.intent {
+            Intent::Handover => {
+                // Stop ours and let Alice answer: she plays the request from Yandex Music.
+                if self.player.state() == PLAYING {
+                    self.player.pause();
+                }
+                self.handed_over = true;
+                eprintln!("voice: handed over to Alice (Yandex Music)");
+            }
             Intent::Play(link) if is_link(&link) => self.load(Fetch::Link(link.trim().to_owned()), from_voice),
             Intent::Play(query) => self.search(query, from_voice),
             Intent::Favorites => self.favorites(from_voice),
@@ -681,6 +711,7 @@ async fn daemon(options: Options) -> Result<(), String> {
         request: 0,
         failures: 0,
         speech: config.speech,
+        handed_over: false,
         last_query: fs::read_to_string(options.state_dir.join("last-query"))
             .ok()
             .map(|s| s.trim().to_owned())

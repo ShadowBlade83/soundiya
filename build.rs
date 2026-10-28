@@ -21,6 +21,8 @@ fn main() {
             "get_period_size_max",
             "set_buffer_size_near",
             "set_period_size_near",
+            "get_format",
+            "get_rate",
         ] {
             println!("cargo:rustc-link-arg=-Wl,--wrap=snd_pcm_hw_params_{name}");
         }

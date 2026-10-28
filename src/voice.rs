@@ -27,6 +27,8 @@ pub enum Intent {
     Previous,
     /// The Alice button: pause what plays, resume what is paused.
     Toggle,
+    /// The phrase names Yandex ("... на Яндекс Музыке"): Alice plays it herself.
+    Handover,
 }
 pub struct Event {
     pub intent: Intent,
@@ -147,6 +149,10 @@ pub fn intent(text: &str) -> Option<Intent> {
     let text = normalize(text);
     if text.is_empty() || LIKES.contains(&text.as_str()) {
         return None;
+    }
+    // "включи Сплин на Яндекс Музыке", "Яндекс музыка, включи ...": leave it to Alice.
+    if text.split_whitespace().any(|w| w.starts_with("яндекс")) {
+        return Some(Intent::Handover);
     }
     // Longest verbs first, so "хочу послушать" is not read as "послушать".
     let mut verbs = VERBS.to_vec();
@@ -679,6 +685,9 @@ mod tests {
         // SoundCloud's bot protection blocks likes from the speaker, so they are left to Alice.
         assert_eq!(intent("Поставь лайк"), None);
         assert_eq!(intent("лайк"), None);
+        assert_eq!(intent("Алиса, включи Сплин на Яндекс Музыке"), Some(Intent::Handover));
+        assert_eq!(intent("Яндекс музыка включи сплин"), Some(Intent::Handover));
+        assert_eq!(intent("включи сплин в яндексе"), Some(Intent::Handover));
         assert_eq!(intent("включи избранное"), Some(Intent::Favorites));
         for s in [
             "включи свет",

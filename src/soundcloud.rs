@@ -521,7 +521,9 @@ fn describe(error: reqwest::Error) -> String {
 
 fn parse_track(v: &Value) -> Option<Track> {
     let id = v["id"].as_u64()?;
-    if v["policy"] == "BLOCK" {
+    // SNIP is a ~30 s preview of a Go+ track: the player would reach its end and skip while
+    // the full length is shown, so it is treated like BLOCK.
+    if v["policy"] == "BLOCK" || v["policy"] == "SNIP" {
         return None;
     }
     let transcodings: Vec<Transcoding> = v["media"]["transcodings"]
@@ -657,5 +659,8 @@ mod tests {
         assert_eq!(ranked[0].1, Codec::Aac);
         assert!(parse_track(&serde_json::json!({"id": 1})).is_none());
         assert!(parse_track(&serde_json::json!({"id":1,"policy":"BLOCK","media":{"transcodings":[]}})).is_none());
+        let snip = serde_json::json!({"id":2,"policy":"SNIP","media":{"transcodings":[
+            {"url":"u","format":{"protocol":"hls","mime_type":"audio/mp4"},"preset":"aac"}]}});
+        assert!(parse_track(&snip).is_none());
     }
 }
