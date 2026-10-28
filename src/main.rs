@@ -41,7 +41,8 @@ soundiya - SoundCloud for Yandex Stations
   soundiya run                daemon (started by the init script)
   soundiya login [TOKEN]      sign in with a SoundCloud OAuth token (see README)
   soundiya logout             forget the token, go back to anonymous mode
-  soundiya play QUERY...      search SoundCloud and play
+  soundiya play QUERY...      search SoundCloud and play; a soundcloud.com link of a track,
+                              playlist (also private) or artist plays that
   soundiya fav                play your liked tracks (needs login)
   soundiya playlist NAME      play a playlist or album (yours first when signed in)
   soundiya top [GENRE]        the SoundCloud top chart; `trending [GENRE]` for the rising one
@@ -276,6 +277,14 @@ enum Fetch {
     Playlist(String),
     Chart { trending: bool, genre: &'static str },
     Related(u64),
+    /// A soundcloud.com link to a track, playlist or artist.
+    Link(String),
+}
+
+fn is_link(text: &str) -> bool {
+    let text = text.trim();
+    (text.starts_with("https://") || text.starts_with("http://")) && text.contains("soundcloud.com")
+        && !text.contains(char::is_whitespace)
 }
 
 /// Alice's answer to a failed voice request, worded for her voice.
@@ -436,6 +445,10 @@ impl App {
                     _ => client.chart(trending, "all-music", 50).await,
                 },
                 Fetch::Related(track) => client.related(track, 50).await,
+                Fetch::Link(url) => client.link(&url, 100).await.map(|(title, tracks)| {
+                    eprintln!("link: {title} ({} tracks)", tracks.len());
+                    tracks
+                }),
             };
             let message = match found {
                 Ok(tracks) if !tracks.is_empty() => Message::Queue { request, tracks },
@@ -511,6 +524,7 @@ impl App {
     fn intent(&mut self, event: voice::Event) {
         let from_voice = event.from_voice;
         match event.intent {
+            Intent::Play(link) if is_link(&link) => self.load(Fetch::Link(link.trim().to_owned()), from_voice),
             Intent::Play(query) => self.search(query, from_voice),
             Intent::Favorites => self.favorites(from_voice),
             Intent::Playlist(name) => self.load(Fetch::Playlist(name), from_voice),
@@ -784,4 +798,18 @@ async fn check(options: Options) -> Result<(), String> {
         println!("5. account: anonymous mode (run 'soundiya login' for your favorites)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_link;
+    #[test]
+    fn recognizes_soundcloud_links_only() {
+        assert!(is_link("https://soundcloud.com/artist/sets/mix"));
+        assert!(is_link(" https://on.soundcloud.com/AbCd12 "));
+        assert!(!is_link("soundcloud.com/artist"));
+        assert!(!is_link("https://example.com/soundcloud"));
+        assert!(!is_link("https://soundcloud.com/a b"));
+        assert!(!is_link("radiohead creep"));
+    }
 }

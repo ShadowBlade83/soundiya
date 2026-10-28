@@ -202,7 +202,10 @@ pub fn intent(text: &str) -> Option<Intent> {
     {
         return Some(Intent::Play(tail.trim().to_owned()));
     }
-    for prefix in ["плейлист ", "альбом ", "подборку ", "сборник ", "playlist "] {
+    for prefix in [
+        "мой плейлист ", "мою подборку ", "мой альбом ", "плейлист ", "альбом ", "подборку ", "сборник ",
+        "playlist ",
+    ] {
         if let Some(name) = rest.strip_prefix(prefix) {
             let name = name.trim().trim_start_matches("под названием ").trim();
             return (!name.is_empty() && name.len() <= 400).then(|| Intent::Playlist(name.to_owned()));
@@ -707,6 +710,7 @@ mod tests {
             ("Включи музыку, похожую на Radiohead", play("radiohead")),
             ("Включи плейлист для тренировки", Some(Intent::Playlist("для тренировки".into()))),
             ("Включи альбом OK Computer", Some(Intent::Playlist("ok computer".into()))),
+            ("Алиса, включи мой плейлист Для дороги", Some(Intent::Playlist("для дороги".into()))),
             ("Включи музыку для сна", Some(Intent::Playlist("для сна".into()))),
             ("Включи популярное", Some(Intent::Chart { trending: false, genre: "all-music" })),
             ("Включи популярный рэп", Some(Intent::Chart { trending: false, genre: "hiphoprap" })),

@@ -339,16 +339,24 @@ impl Client {
     /// public search. Returns its title and tracks.
     pub async fn playlist(&self, query: &str, limit: usize) -> Res<Option<(String, Vec<Track>)>> {
         let mut candidates: Vec<(u64, String)> = Vec::new();
-        if self.logged_in()
+        let own_list = if self.logged_in()
             && let Ok(user) = self.me().await
-            && let Ok(value) = self
+        {
+            let list = self
                 .call(
                     reqwest::Method::GET,
                     &format!("{API}/users/{user}/playlists/liked_and_owned"),
                     &[("limit", "50")],
                 )
-                .await
-        {
+                .await;
+            if let Err(e) = &list {
+                eprintln!("playlists: your own list is unavailable ({e})");
+            }
+            list.ok()
+        } else {
+            None
+        };
+        if let Some(value) = own_list {
             let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
             let mut own: Vec<(usize, u64, String)> = value["collection"]
                 .as_array()
@@ -363,6 +371,11 @@ impl Client {
                 })
                 .filter(|(_, id, _)| *id != 0)
                 .collect();
+            eprintln!(
+                "playlists: {} of yours match '{query}' among {}",
+                own.len(),
+                value["collection"].as_array().map_or(0, Vec::len)
+            );
             own.sort_by_key(|(hits, ..)| std::cmp::Reverse(*hits));
             candidates.extend(own.into_iter().map(|(_, id, title)| (id, title)));
         }
@@ -384,6 +397,31 @@ impl Client {
             }
         }
         Ok(None)
+    }
+
+    /// What a soundcloud.com link points to: a track, a playlist or album (also private ones
+    /// with a secret link), or an artist (their latest tracks). Returns a title and the tracks.
+    pub async fn link(&self, url: &str, limit: usize) -> Res<(String, Vec<Track>)> {
+        let value = self.call(reqwest::Method::GET, &format!("{API}/resolve"), &[("url", url)]).await?;
+        let title = value["title"].as_str().or(value["username"].as_str()).unwrap_or("SoundCloud").to_owned();
+        let tracks = match value["kind"].as_str() {
+            Some("track") => self.complete(&[&value]).await?,
+            Some("playlist") | Some("system-playlist") => {
+                let items: Vec<&Value> = value["tracks"].as_array().into_iter().flatten().take(limit).collect();
+                self.complete(&items).await?
+            }
+            Some("user") => {
+                let id = value["id"].as_u64().ok_or("the link has no user id")?;
+                let limit = limit.to_string();
+                let found = self
+                    .call(reqwest::Method::GET, &format!("{API}/users/{id}/tracks"), &[("limit", &limit)])
+                    .await?;
+                let items: Vec<&Value> = found["collection"].as_array().into_iter().flatten().collect();
+                self.complete(&items).await?
+            }
+            other => return Err(format!("this link is not a track, playlist or artist ({})", other.unwrap_or("unknown"))),
+        };
+        Ok((title, tracks))
     }
 
     /// Tracks like `track`, as SoundCloud's own "related" list suggests them.
