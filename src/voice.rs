@@ -90,7 +90,7 @@ const PREVIOUS: &[&str] = &[
 const RESUME: &[&str] = &[
     "продолжи", "продолжай", "продолжи музыку", "продолжай музыку", "продолжить", "продолжить музыку",
     "играй дальше", "верни музыку", "включи музыку", "включи обратно", "сними с паузы", "сними паузу",
-    "возобнови", "возобнови музыку",
+    "возобнови", "возобнови музыку", "играй", "играй музыку",
 ];
 const FAVORITES: &[&str] = &[
     "избранное", "любимое", "любимые", "любимые треки", "любимую музыку", "мою музыку", "мою любимую музыку",
@@ -655,6 +655,7 @@ async fn read_events(
     sender: &mpsc::Sender<Event>,
     ducking: &crate::ducking::Ducking,
     guard: &crate::audio_guard::AudioGuard,
+    warm: &tokio::sync::Notify,
     seen: &mut VecDeque<String>,
 ) -> io::Result<()> {
     let mut data = Vec::with_capacity(4096);
@@ -675,6 +676,9 @@ async fn read_events(
         {
             last_state = Some(state);
             eprintln!("voice: alice state {state}");
+            if state == 1 {
+                warm.notify_one(); // LISTENING: a request may follow
+            }
         }
         if let Some(busy) = alice_busy(&data) {
             ducking.set_busy(busy);
@@ -713,6 +717,7 @@ pub async fn watch(
     sender: mpsc::Sender<Event>,
     ducking: Arc<crate::ducking::Ducking>,
     guard: Arc<crate::audio_guard::AudioGuard>,
+    warm: Arc<tokio::sync::Notify>,
     address: SocketAddr,
 ) {
     let mut seen: VecDeque<String> = VecDeque::new();
@@ -720,7 +725,7 @@ pub async fn watch(
         let result: io::Result<()> = async {
             let mut socket = TcpStream::connect(address).await?;
             eprintln!("voice: connected to native Alice events");
-            read_events(&mut socket, &sender, &ducking, &guard, &mut seen).await
+            read_events(&mut socket, &sender, &ducking, &guard, &warm, &mut seen).await
         }
         .await;
         ducking.set_busy(false);
@@ -800,6 +805,8 @@ mod tests {
         assert_eq!(intent("Останови музыку"), Some(Intent::Pause));
         assert_eq!(intent("Алиса выключи"), Some(Intent::Pause));
         assert_eq!(intent("Включи музыку"), Some(Intent::Resume));
+        assert_eq!(intent("Играй"), Some(Intent::Resume));
+        assert_eq!(intent("Алиса, играй музыку"), Some(Intent::Resume));
         assert_eq!(intent("следующий трек"), Some(Intent::Next));
         // SoundCloud's bot protection blocks likes from the speaker, so they are left to Alice.
         assert_eq!(intent("Поставь лайк"), None);

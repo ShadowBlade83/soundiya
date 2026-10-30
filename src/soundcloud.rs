@@ -4,12 +4,16 @@ use serde_json::Value;
 use std::{
     path::PathBuf,
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const API: &str = "https://api-v2.soundcloud.com";
 const HOME: &str = "https://soundcloud.com/";
 const ASSETS: &str = "https://a-v2.sndcdn.com/assets/";
+/// How long a kept-alive connection may wait for the next request.
+const POOL_IDLE: Duration = Duration::from_secs(60);
+/// Alice reports LISTENING more than once per phrase; one warm-up covers them.
+const WARM_EVERY: Duration = Duration::from_secs(3);
 const AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 pub type Res<T> = Result<T, String>;
@@ -72,6 +76,14 @@ pub struct Stream {
 pub struct Client {
     api: reqwest::Client,
     media: reqwest::Client,
+    /// The same clients with keep-alive, used while `reuse` says the bypass leaves
+    /// connections untouched: no handshake to protect, so a finished one may serve again.
+    api_pooled: reqwest::Client,
+    media_pooled: reqwest::Client,
+    reuse: Box<dyn Fn() -> bool + Send + Sync>,
+    warmed: Mutex<Option<Instant>>,
+    /// When the server last turned the login down; until a while later requests go without it.
+    rejected: Mutex<Option<Instant>>,
     state_dir: PathBuf,
     client_id: tokio::sync::Mutex<Option<String>>,
     oauth: Mutex<Option<String>>,
@@ -81,14 +93,18 @@ pub struct Client {
 impl Client {
     /// `proxy` is the loopback bypass proxy; every request goes through it.
     pub fn new(state_dir: PathBuf, proxy: Option<&str>) -> Res<Self> {
-        let build = |timeout: Option<Duration>| -> Res<reqwest::Client> {
+        let build = |timeout: Option<Duration>, pooled: bool| -> Res<reqwest::Client> {
             let mut builder = reqwest::Client::builder()
                 .user_agent(AGENT)
-                .connect_timeout(Duration::from_secs(20))
+                .connect_timeout(Duration::from_secs(20));
+            builder = if pooled {
+                builder.pool_idle_timeout(POOL_IDLE)
+            } else {
                 // A middlebox that disguised handshakes can still cut a flow once the first
                 // answer has gone through, so a finished connection is never reused: the next
                 // request opens a new one and goes through the bypass again.
-                .pool_max_idle_per_host(0);
+                builder.pool_max_idle_per_host(0)
+            };
             if let Some(timeout) = timeout {
                 builder = builder.timeout(timeout);
             }
@@ -107,8 +123,13 @@ impl Client {
             .and_then(|s| clean_token(&s));
         Ok(Self {
             // The whole-request timeout would cut long audio bodies, so streams get none.
-            api: build(Some(Duration::from_secs(25)))?,
-            media: build(None)?,
+            api: build(Some(Duration::from_secs(25)), false)?,
+            media: build(None, false)?,
+            api_pooled: build(Some(Duration::from_secs(25)), true)?,
+            media_pooled: build(None, true)?,
+            reuse: Box::new(|| false),
+            warmed: Mutex::new(None),
+            rejected: Mutex::new(None),
             state_dir,
             client_id: tokio::sync::Mutex::new(client_id),
             oauth: Mutex::new(oauth),
@@ -116,8 +137,37 @@ impl Client {
         })
     }
 
+    /// Keeps connections alive between requests while `reuse` holds (checked per request, so
+    /// switching the bypass on later goes back to one connection per request).
+    pub fn reuse_connections_when(mut self, reuse: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.reuse = Box::new(reuse);
+        self
+    }
+    fn api(&self) -> &reqwest::Client {
+        if (self.reuse)() { &self.api_pooled } else { &self.api }
+    }
     pub fn media_http(&self) -> reqwest::Client {
-        self.media.clone()
+        if (self.reuse)() { self.media_pooled.clone() } else { self.media.clone() }
+    }
+    /// Opens a kept-alive connection to the API ahead of a request, while Alice still listens
+    /// to the phrase, so the search does not wait for the TCP and TLS handshakes.
+    pub async fn warm(&self) {
+        if !(self.reuse)() {
+            return;
+        }
+        {
+            let mut warmed = self.warmed.lock().unwrap();
+            if warmed.is_some_and(|at| at.elapsed() < WARM_EVERY) {
+                return;
+            }
+            *warmed = Some(Instant::now());
+        }
+        let started = Instant::now();
+        // Any answer will do (the root has no content): the connection is what matters.
+        match self.api_pooled.head(format!("{API}/")).timeout(Duration::from_secs(5)).send().await {
+            Ok(_) => eprintln!("soundcloud: connection warmed in {} ms", started.elapsed().as_millis()),
+            Err(e) => eprintln!("soundcloud: warm-up failed: {}", describe(e)),
+        }
     }
     pub fn logged_in(&self) -> bool {
         self.oauth.lock().unwrap().is_some()
@@ -133,6 +183,7 @@ impl Client {
         }
         *self.oauth.lock().unwrap() = token;
         *self.user_id.lock().unwrap() = None;
+        *self.rejected.lock().unwrap() = None;
         Ok(())
     }
 
@@ -182,7 +233,7 @@ impl Client {
     async fn text(&self, url: &str) -> Res<String> {
         let mut last = String::new();
         for _ in 0..2 {
-            let response = match self.api.get(url).send().await {
+            let response = match self.api().get(url).send().await {
                 Ok(response) => response,
                 Err(e) => {
                     last = describe(e);
@@ -207,7 +258,16 @@ impl Client {
         url: &str,
         params: &[(&str, &str)],
     ) -> Res<Value> {
-        let token = self.oauth.lock().unwrap().clone();
+        let mut token = self.oauth.lock().unwrap().clone();
+        // Right after the login was turned down, do not spend two more requests on it.
+        let recently_rejected = self
+            .rejected
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(10 * 60));
+        if recently_rejected && method == reqwest::Method::GET {
+            token = None;
+        }
         let mut last = String::new();
         // The last attempt goes without the login: a rejected (for instance expired JWT, they
         // last a day) token must not break searching, which works anonymously.
@@ -215,7 +275,7 @@ impl Client {
         for attempt in 0..attempts {
             let id = self.client_id(attempt > 0 && last.contains("HTTP 401")).await?;
             let mut request = self
-                .api
+                .api()
                 .request(method.clone(), url)
                 .query(&[("client_id", id.as_str())])
                 .query(params);
@@ -233,6 +293,10 @@ impl Client {
             };
             let status = response.status();
             if status.is_success() {
+                // It worked only once the login was left out: remember that for a while.
+                if attempt >= 2 && token.is_some() {
+                    *self.rejected.lock().unwrap() = Some(Instant::now());
+                }
                 let text = response.text().await.map_err(describe)?;
                 return Ok(serde_json::from_str(&text).unwrap_or(Value::Null));
             }
@@ -667,5 +731,40 @@ mod tests {
         let snip = serde_json::json!({"id":2,"policy":"SNIP","media":{"transcodings":[
             {"url":"u","format":{"protocol":"hls","mime_type":"audio/mp4"},"preset":"aac"}]}});
         assert!(parse_track(&snip).is_none());
+    }
+
+    /// Counts the connections a keep-alive HTTP server sees for two requests in a row.
+    async fn connections_for_two_requests(reuse: bool) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok(n) = socket.read(&mut buf).await {
+                        if n == 0 || socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let client = Client::new(std::env::temp_dir(), None).unwrap().reuse_connections_when(move || reuse);
+        for _ in 0..2 {
+            let body = client.api().get(&url).send().await.unwrap().text().await.unwrap();
+            assert_eq!(body, "{}");
+        }
+        accepted.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn connections_are_kept_alive_only_when_allowed() {
+        assert_eq!(connections_for_two_requests(true).await, 1);
+        assert_eq!(connections_for_two_requests(false).await, 2);
     }
 }

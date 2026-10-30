@@ -201,10 +201,16 @@ async fn fetch(
     url: &str,
     sender: &mpsc::Sender<io::Result<Bytes>>,
 ) -> Result<(), String> {
-    let mut response = tokio::time::timeout(STALL, http.get(url).send())
-        .await
-        .map_err(|_| "audio download: no answer from the server".to_owned())?
-        .map_err(|e| e.to_string())?;
+    let mut retried = false;
+    let mut response = loop {
+        match tokio::time::timeout(STALL, http.get(url).send()).await {
+            Err(_) => return Err("audio download: no answer from the server".to_owned()),
+            // A kept-alive connection the server closed meanwhile fails at once; one more try
+            // opens a fresh one.
+            Ok(Err(_)) if !retried => retried = true,
+            Ok(result) => break result.map_err(|e| e.to_string())?,
+        }
+    };
     if !response.status().is_success() {
         return Err(format!("audio download: HTTP {}", response.status()));
     }

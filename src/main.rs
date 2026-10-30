@@ -700,7 +700,13 @@ async fn daemon(options: Options) -> Result<(), String> {
 
     let (proxy, bypass_handle) = bypass::start(config.bypass.clone(), Some(&options.state_dir)).await.map_err(err)?;
     eprintln!("bypass: {:?} via 127.0.0.1:{}", bypass_handle.strategy(), proxy.port());
-    let client = Arc::new(Client::new(options.state_dir.clone(), Some(&format!("http://{proxy}")))?);
+    let client = Arc::new(
+        Client::new(options.state_dir.clone(), Some(&format!("http://{proxy}")))?
+            .reuse_connections_when({
+                let bypass = bypass_handle.clone();
+                move || bypass.untouched()
+            }),
+    );
     eprintln!(
         "soundcloud: {}",
         if client.logged_in() { "signed in" } else { "anonymous mode" }
@@ -719,7 +725,18 @@ async fn daemon(options: Options) -> Result<(), String> {
     let (sender, mut receiver) = mpsc::channel::<voice::Event>(8);
     let voice_enabled = options.voice && config.voice && native.is_some();
     if voice_enabled && let Some(address) = native {
-        tokio::spawn(voice::watch(sender.clone(), ducking.clone(), guard.clone(), address));
+        // Alice starts listening: open the connection the coming request will need.
+        let warm = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn({
+            let (warm, client) = (warm.clone(), client.clone());
+            async move {
+                loop {
+                    warm.notified().await;
+                    client.warm().await;
+                }
+            }
+        });
+        tokio::spawn(voice::watch(sender.clone(), ducking.clone(), guard.clone(), warm, address));
     }
     if let Some(address) = native {
         let guard = guard.clone();

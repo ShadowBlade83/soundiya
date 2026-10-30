@@ -259,6 +259,10 @@ impl Handle {
     pub fn strategy(&self) -> String {
         self.shared.setting.lock().unwrap().clone()
     }
+    /// True when new connections go out untouched (`off`): nothing about them to protect.
+    pub fn untouched(&self) -> bool {
+        *self.shared.order.lock().unwrap() == [Strategy::Plain]
+    }
 }
 
 /// Starts the loopback proxy; the address is what `reqwest` should be pointed at.
@@ -1035,6 +1039,7 @@ mod tests {
         };
         let (_, handle) = start(cfg, None).await.unwrap();
         assert_eq!(handle.strategy(), "off");
+        assert!(handle.untouched());
         assert!(handle.set_strategy("no such strategy").is_err());
         assert_eq!(handle.strategy(), "off", "a bad name changes nothing");
         handle.set_strategy("ALT 11").unwrap();
