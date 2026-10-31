@@ -15,7 +15,7 @@ mod voice;
 mod volume_guard;
 
 use player::{Event as PlayerEvent, IDLE, PAUSED, PLAYING, Player};
-use soundcloud::{Client, Track};
+use soundcloud::{Client, Stream, Track};
 use std::{
     fs,
     io::{Read, Write},
@@ -24,7 +24,7 @@ use std::{
     path::PathBuf,
     process::ExitCode,
     sync::{Arc, Mutex, atomic::Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use voice::Intent;
@@ -34,6 +34,18 @@ const VOICE_EXPIRY: Duration = Duration::from_secs(5);
 /// How many search results are queued behind the first one.
 const QUEUE: usize = 25;
 const MAX_FAILURES: u32 = 4;
+/// A prefetched stream link is used only while this fresh; the links are signed and expire.
+const PREFETCH_TTL: Duration = Duration::from_secs(60);
+/// The next track's link is fetched when this little of the current track is left.
+const PREFETCH_BEFORE_END_MS: u64 = 20_000;
+
+/// The stream link of the track after the current one, resolved ahead of "дальше" or the end.
+struct Prefetch {
+    track: u64,
+    /// `None` while the request is under way or after it failed.
+    stream: Option<Stream>,
+    at: Instant,
+}
 
 const USAGE: &str = "\
 soundiya - SoundCloud for Yandex Stations
@@ -52,6 +64,7 @@ soundiya - SoundCloud for Yandex Stations
   soundiya seek SECONDS       jump within the track: seek 20, seek -10
   soundiya restart            play the current track from the beginning
   soundiya repeat [on|off]    repeat the current track endlessly
+  soundiya sleep MINUTES|off  pause the music after MINUTES (voice: выключись через 30 минут)
   soundiya volume 0-100
   soundiya status             what is playing now
   soundiya check              test SoundCloud access and the DPI bypass
@@ -130,6 +143,7 @@ fn main() -> ExitCode {
         "seek" => command_line("SEEK", &rest),
         "restart" => command_line("RESTART", ""),
         "repeat" => command_line("REPEAT", &rest),
+        "sleep" => command_line("SLEEP", &rest),
         "volume" => command_line("VOLUME", &rest),
         "status" => command_line("STATUS", ""),
         "logout" => command_line("LOGOUT", ""),
@@ -276,6 +290,8 @@ enum Message {
     },
     /// The track of this generation could not be started.
     Unplayable(u64, String),
+    /// The sleep timer with this id ran out.
+    Sleep(u64),
 }
 
 /// What to put in the queue besides a plain search.
@@ -322,11 +338,73 @@ struct App {
     handed_over: bool,
     /// The current track starts again when it ends; cleared when a new queue is loaded.
     repeat: bool,
+    prefetch: Arc<Mutex<Option<Prefetch>>>,
+    /// When the sleep timer pauses the music; `sleep_id` tells a cancelled timer from the
+    /// pending one.
+    sleep_at: Option<Instant>,
+    sleep_id: u64,
 }
 
 impl App {
     fn active(&self) -> bool {
         self.generation != 0
+    }
+
+    /// Alice started listening: a request may follow, so get the connection and, for
+    /// "дальше", the next track's link ready while the phrase is still being said.
+    fn listening(&self) {
+        let client = self.client.clone();
+        tokio::spawn(async move { client.warm().await });
+        self.prefetch_next();
+    }
+
+    /// Near the end of a track the next one is about to start on its own.
+    fn prefetch_near_end(&self) {
+        if self.player.state() != PLAYING {
+            return;
+        }
+        let Some(track) = self.queue.get(self.index) else { return };
+        let position = self.player.shared.position_ms.load(Ordering::Relaxed);
+        if track.duration_ms > 0 && track.duration_ms.saturating_sub(position) < PREFETCH_BEFORE_END_MS {
+            self.prefetch_next();
+        }
+    }
+
+    fn prefetch_next(&self) {
+        if !self.active() || self.repeat {
+            return;
+        }
+        let Some(next) = self.queue.get(self.index + 1).cloned() else { return };
+        {
+            let mut slot = self.prefetch.lock().unwrap();
+            // A link fetched (or being fetched) recently is still good enough.
+            if slot.as_ref().is_some_and(|p| p.track == next.id && p.at.elapsed() < PREFETCH_TTL / 2) {
+                return;
+            }
+            *slot = Some(Prefetch { track: next.id, stream: None, at: Instant::now() });
+        }
+        let (client, slot) = (self.client.clone(), self.prefetch.clone());
+        tokio::spawn(async move {
+            let stream = client.stream(&next).await.ok();
+            let mut slot = slot.lock().unwrap();
+            if let Some(p) = slot.as_mut().filter(|p| p.track == next.id && p.stream.is_none()) {
+                p.stream = stream;
+                p.at = Instant::now();
+            }
+        });
+    }
+
+    /// The prefetched link for `track`, if there is a fresh one; it is used once.
+    fn take_prefetched(&self, track: u64) -> Option<Stream> {
+        let mut slot = self.prefetch.lock().unwrap();
+        let usable = slot
+            .as_ref()
+            .is_some_and(|p| p.track == track && p.stream.is_some() && p.at.elapsed() < PREFETCH_TTL);
+        if !usable {
+            return None;
+        }
+        eprintln!("player: using the prefetched stream link");
+        slot.take().and_then(|p| p.stream)
     }
     fn status(&self) -> String {
         let state = match self.player.state() {
@@ -352,7 +430,10 @@ impl App {
             self.queue.len(),
             if self.repeat { " repeat" } else { "" },
             if self.client.logged_in() { "signed in" } else { "anonymous" },
-        )
+        ) + &self
+            .sleep_at
+            .map(|at| format!(" | sleep in {} min", at.saturating_duration_since(Instant::now()).as_secs().div_ceil(60)))
+            .unwrap_or_default()
     }
 
     fn stop(&mut self) {
@@ -377,8 +458,13 @@ impl App {
             self.messages.clone(),
         );
         eprintln!("player: {}", track.label());
+        let ready = self.take_prefetched(track.id);
         tokio::spawn(async move {
-            match client.stream(&track).await {
+            let stream = match ready {
+                Some(stream) => Ok(stream),
+                None => client.stream(&track).await,
+            };
+            match stream {
                 Ok(stream) if player.is_current(generation) => {
                     let source = player.open(generation, client.media_http(), stream);
                     player.play_from(generation, source, from_ms);
@@ -486,6 +572,7 @@ impl App {
         let Some(address) = self.native.filter(|_| self.speech) else { return };
         // Keeps the music guard from pausing the station's player (and her voice) meanwhile.
         self.guard.hold(Duration::from_secs(20));
+        let guard = self.guard.clone();
         tokio::spawn(async move {
             if from_voice {
                 tokio::time::sleep(voice::CANCELS_DONE).await;
@@ -494,6 +581,9 @@ impl App {
                 Ok(()) => eprintln!("say: '{text}'"),
                 Err(e) => eprintln!("say: {e}"),
             }
+            // If Alice started her own music during the sentence (an answer to the next
+            // phrase), it stops now rather than when the 20 s hold runs out.
+            guard.release();
         });
     }
 
@@ -553,6 +643,8 @@ impl App {
                     | Intent::Seek(_)
                     | Intent::Restart
                     | Intent::Loop(_)
+                    | Intent::SleepIn(_)
+                    | Intent::CancelSleep
                     | Intent::Handover => return,
                     _ => self.handed_over = false,
                 }
@@ -636,6 +728,26 @@ impl App {
                 let words = if self.repeat { "Повторяю этот трек" } else { "Повтор выключен" };
                 self.say(words.to_owned(), from_voice);
             }
+            // Alice's own sleep timer stops only her player, so ours handles our music.
+            Intent::SleepIn(seconds) if self.active() => {
+                self.silence(from_voice);
+                self.sleep_id += 1;
+                self.sleep_at = Some(Instant::now() + Duration::from_secs(seconds.into()));
+                let (id, messages) = (self.sleep_id, self.messages.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(seconds.into())).await;
+                    let _ = messages.send(Message::Sleep(id));
+                });
+                eprintln!("sleep: pausing in {seconds} s");
+                self.say(format!("Хорошо, выключу музыку через {}", voice::spoken_duration(seconds)), from_voice);
+            }
+            Intent::CancelSleep if self.sleep_at.is_some() => {
+                self.silence(from_voice);
+                self.sleep_at = None;
+                self.sleep_id += 1;
+                eprintln!("sleep: cancelled");
+                self.say("Таймер выключения отменён".to_owned(), from_voice);
+            }
             // The button also reaches Alice, who would complain about the missing Plus.
             Intent::Toggle => {
                 self.silence(true);
@@ -653,7 +765,9 @@ impl App {
             | Intent::NowPlaying
             | Intent::Seek(_)
             | Intent::Restart
-            | Intent::Loop(_) => {}
+            | Intent::Loop(_)
+            | Intent::SleepIn(_)
+            | Intent::CancelSleep => {}
         }
     }
 
@@ -674,13 +788,37 @@ impl App {
             Message::Unplayable(generation, error) if generation == self.generation => {
                 self.fail_current(&error)
             }
+            Message::Sleep(id) if id == self.sleep_id && self.sleep_at.is_some() => {
+                self.sleep_at = None;
+                eprintln!("sleep: time is up, pausing");
+                if self.player.state() == PLAYING {
+                    self.player.pause();
+                }
+                // Alice's player too, in case the music moved to Yandex Music meanwhile.
+                if let Some(address) = self.native {
+                    tokio::spawn(async move {
+                        let _ = voice::pause_native(address).await;
+                    });
+                }
+            }
             _ => {}
         }
     }
 
     fn player_event(&mut self, event: PlayerEvent) {
         match event {
-            PlayerEvent::Started(g) if g == self.generation => self.failures = 0,
+            PlayerEvent::Started(g) if g == self.generation => {
+                self.failures = 0;
+                // Alice may start her own player a moment after ours (a voice request while
+                // Yandex Music was active): pause it again shortly, not only every 10 s.
+                let guard = self.guard.clone();
+                tokio::spawn(async move {
+                    for delay in [1500, 2500] {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        guard.nudge();
+                    }
+                });
+            }
             // On repeat the same track starts again instead of the next one.
             PlayerEvent::Ended(g) if g == self.generation && self.repeat => self.start_at(self.index, 0),
             PlayerEvent::Ended(g) if g == self.generation => self.advance(),
@@ -724,19 +862,10 @@ async fn daemon(options: Options) -> Result<(), String> {
     let native = profile.voice.as_ref().map(|v| v.address);
     let (sender, mut receiver) = mpsc::channel::<voice::Event>(8);
     let voice_enabled = options.voice && config.voice && native.is_some();
+    // Alice starts listening: the main loop prepares what the coming request will need.
+    let listening = Arc::new(tokio::sync::Notify::new());
     if voice_enabled && let Some(address) = native {
-        // Alice starts listening: open the connection the coming request will need.
-        let warm = Arc::new(tokio::sync::Notify::new());
-        tokio::spawn({
-            let (warm, client) = (warm.clone(), client.clone());
-            async move {
-                loop {
-                    warm.notified().await;
-                    client.warm().await;
-                }
-            }
-        });
-        tokio::spawn(voice::watch(sender.clone(), ducking.clone(), guard.clone(), warm, address));
+        tokio::spawn(voice::watch(sender.clone(), ducking.clone(), guard.clone(), listening.clone(), address));
     }
     if let Some(address) = native {
         let guard = guard.clone();
@@ -780,6 +909,9 @@ async fn daemon(options: Options) -> Result<(), String> {
         speech: config.speech,
         handed_over: false,
         repeat: false,
+        prefetch: Arc::new(Mutex::new(None)),
+        sleep_at: None,
+        sleep_id: 0,
         last_query: fs::read_to_string(options.state_dir.join("last-query"))
             .ok()
             .map(|s| s.trim().to_owned())
@@ -801,7 +933,9 @@ async fn daemon(options: Options) -> Result<(), String> {
             }
             Some(message) = inbox.recv() => app.message(message),
             Some(event) = player_events.recv() => app.player_event(event),
+            _ = listening.notified() => app.listening(),
             _ = tick.tick() => {
+                app.prefetch_near_end();
                 let state = app.player.state();
                 app.guard.set_playing(state == PLAYING);
                 buttons_active.store(app.active(), Ordering::Release);

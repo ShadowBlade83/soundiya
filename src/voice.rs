@@ -35,6 +35,10 @@ pub enum Intent {
     Restart,
     /// Repeat the current track endlessly (`true`) or stop doing so.
     Loop(bool),
+    /// Pause the music after this many seconds ("выключись через 30 минут").
+    SleepIn(u32),
+    /// Forget the pending `SleepIn`.
+    CancelSleep,
 }
 pub struct Event {
     pub intent: Intent,
@@ -80,12 +84,15 @@ const NEXT: &[&str] = &[
     "пропусти песню", "скип", "другую песню", "другой трек", "включи другую", "включи другое",
     "включи следующий", "включи следующую", "включи следующий трек", "включи следующую песню",
     "давай дальше", "давай следующую",
+    "трек вперед", "песню вперед", "песня вперед", "на трек вперед", "на песню вперед",
 ];
 const PREVIOUS: &[&str] = &[
     "назад", "предыдущий", "предыдущая", "предыдущую", "предыдущий трек", "предыдущая песня",
     "предыдущую песню", "прошлая песня", "прошлую песню", "прошлый трек", "вернись", "верни предыдущую",
     "обратно", "обратно назад", "обратно назад песню", "назад песню", "назад трек", "вернуть назад",
     "верни предыдущий", "включи предыдущий", "включи предыдущую", "включи прошлую", "поставь предыдущую",
+    "трек назад", "песню назад", "песня назад", "на трек назад", "на песню назад", "назад на трек",
+    "назад на песню", "верни трек", "верни песню",
 ];
 const RESUME: &[&str] = &[
     "продолжи", "продолжай", "продолжи музыку", "продолжай музыку", "продолжить", "продолжить музыку",
@@ -132,54 +139,60 @@ pub fn genre_of(text: &str) -> Option<&'static str> {
 
 /// Seconds in a spoken duration: "20 секунд", "двадцать пять секунд", "минуту", "полторы минуты",
 /// "1 минуту 30 секунд". A number without a unit counts as seconds.
-fn duration(words: &[&str]) -> Option<u32> {
-    fn number(word: &str) -> Option<f64> {
-        if let Ok(n) = word.parse::<u32>() {
-            return Some(f64::from(n));
-        }
-        Some(match word {
-            "ноль" => 0.0,
-            "один" | "одна" | "одну" => 1.0,
-            "два" | "две" | "пару" => 2.0,
-            "три" => 3.0,
-            "четыре" => 4.0,
-            "пять" => 5.0,
-            "шесть" => 6.0,
-            "семь" => 7.0,
-            "восемь" => 8.0,
-            "девять" => 9.0,
-            "десять" => 10.0,
-            "одиннадцать" => 11.0,
-            "двенадцать" => 12.0,
-            "тринадцать" => 13.0,
-            "четырнадцать" => 14.0,
-            "пятнадцать" => 15.0,
-            "шестнадцать" => 16.0,
-            "семнадцать" => 17.0,
-            "восемнадцать" => 18.0,
-            "девятнадцать" => 19.0,
-            "двадцать" => 20.0,
-            "тридцать" => 30.0,
-            "сорок" => 40.0,
-            "пятьдесят" => 50.0,
-            "шестьдесят" => 60.0,
-            "семьдесят" => 70.0,
-            "восемьдесят" => 80.0,
-            "девяносто" => 90.0,
-            "полторы" | "полтора" => 1.5,
-            "пол" => 0.5,
-            _ => return None,
-        })
+/// A spoken number: digits or a word, "полторы" and "пол" included.
+fn spoken_number(word: &str) -> Option<f64> {
+    if let Ok(n) = word.parse::<u32>() {
+        return Some(f64::from(n));
     }
+    Some(match word {
+        "ноль" => 0.0,
+        "один" | "одна" | "одну" => 1.0,
+        "два" | "две" | "пару" => 2.0,
+        "три" => 3.0,
+        "четыре" => 4.0,
+        "пять" => 5.0,
+        "шесть" => 6.0,
+        "семь" => 7.0,
+        "восемь" => 8.0,
+        "девять" => 9.0,
+        "десять" => 10.0,
+        "одиннадцать" => 11.0,
+        "двенадцать" => 12.0,
+        "тринадцать" => 13.0,
+        "четырнадцать" => 14.0,
+        "пятнадцать" => 15.0,
+        "шестнадцать" => 16.0,
+        "семнадцать" => 17.0,
+        "восемнадцать" => 18.0,
+        "девятнадцать" => 19.0,
+        "двадцать" => 20.0,
+        "тридцать" => 30.0,
+        "сорок" => 40.0,
+        "пятьдесят" => 50.0,
+        "шестьдесят" => 60.0,
+        "семьдесят" => 70.0,
+        "восемьдесят" => 80.0,
+        "девяносто" => 90.0,
+        "полторы" | "полтора" => 1.5,
+        "пол" => 0.5,
+        _ => return None,
+    })
+}
+
+/// "двадцать пять": tens followed by units add up; any other number replaces the last one.
+fn add_number(pending: Option<f64>, n: f64) -> f64 {
+    match pending {
+        Some(p) if p >= 20.0 && p % 10.0 == 0.0 && n < 10.0 => p + n,
+        _ => n,
+    }
+}
+
+fn duration(words: &[&str]) -> Option<u32> {
     let mut total = 0.0;
     let mut pending: Option<f64> = None;
     for word in words {
-        if let Some(n) = number(word) {
-            // "двадцать пять": tens followed by units add up.
-            pending = Some(match pending {
-                Some(p) if p >= 20.0 && p % 10.0 == 0.0 && n < 10.0 => p + n,
-                _ => n,
-            });
+        if let Some(n) = spoken_number(word) {
+            pending = Some(add_number(pending, n));
         } else if word.starts_with("полминут") {
             total += 30.0;
         } else if word.starts_with("сек") {
@@ -190,6 +203,90 @@ fn duration(words: &[&str]) -> Option<u32> {
     }
     total += pending.unwrap_or(0.0);
     (total > 0.0).then(|| total.min(3600.0) as u32)
+}
+
+/// "через полтора часа", "на 40 минут", "через час двадцать": seconds, at most 12 hours.
+/// A number without a unit counts as minutes ("выключись через 30").
+fn sleep_duration(words: &[&str]) -> Option<u32> {
+    let mut total = 0.0;
+    let mut pending: Option<f64> = None;
+    for word in words {
+        if let Some(n) = spoken_number(word) {
+            pending = Some(add_number(pending, n));
+        } else if word.starts_with("полчас") {
+            total += 1800.0;
+        } else if word.starts_with("час") {
+            total += pending.take().unwrap_or(1.0) * 3600.0;
+        } else if word.starts_with("мин") {
+            total += pending.take().unwrap_or(1.0) * 60.0;
+        } else if word.starts_with("сек") {
+            total += pending.take().unwrap_or(1.0);
+        }
+    }
+    total += pending.unwrap_or(0.0) * 60.0;
+    (total >= 1.0).then(|| total.min(12.0 * 3600.0) as u32)
+}
+
+/// Russian plural: 1 минуту, 2 минуты, 5 минут.
+fn plural<'a>(n: u32, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
+    match (n % 10, n % 100) {
+        (1, r) if r != 11 => one,
+        (2..=4, r) if !(12..=14).contains(&r) => few,
+        _ => many,
+    }
+}
+
+/// "30 минут", "1 час 20 минут", "2 часа" for Alice to read out.
+pub fn spoken_duration(seconds: u32) -> String {
+    let (hours, minutes) = (seconds / 3600, seconds % 3600 / 60);
+    let mut parts = Vec::new();
+    if hours > 0 {
+        parts.push(format!("{hours} {}", plural(hours, "час", "часа", "часов")));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes} {}", plural(minutes, "минуту", "минуты", "минут")));
+    }
+    if parts.is_empty() {
+        parts.push(format!("{seconds} {}", plural(seconds, "секунду", "секунды", "секунд")));
+    }
+    parts.join(" ")
+}
+
+/// "выключись через 30 минут", "выключи музыку через час", "таймер сна на 40 минут",
+/// "отмени таймер сна", "не выключайся". A bare "отмени таймер" stays with Alice: it may be
+/// her kitchen timer.
+fn sleep(text: &str) -> Option<Intent> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() > 10 {
+        return None;
+    }
+    let has = |prefix: &str| words.iter().any(|w| w.starts_with(prefix));
+    let timer = has("таймер") && (words.contains(&"сна") || has("выключ") || has("отключ"));
+    let off = has("выключ") || has("отключ") || has("останов") || has("пауз") || has("усни") || has("засни");
+    let at = words.iter().position(|w| *w == "через").or_else(|| {
+        timer.then(|| words.iter().position(|w| *w == "на")).flatten()
+    });
+    // Only the music or the station itself: "выключи свет через 10 минут" is Alice's.
+    const ABOUT: &[&str] = &[
+        "выключи", "выключись", "выключай", "отключи", "отключись", "останови", "остановись", "поставь",
+        "на", "паузу", "пауза", "музыку", "музыка", "песню", "воспроизведение", "плеер", "усни", "засни",
+        "колонку", "станцию", "таймер", "сна", "выключения", "отключения", "сон", "мне", "все", "всё",
+    ];
+    if let Some(at) = at
+        && (off || timer)
+        && words[..at].iter().all(|w| ABOUT.contains(w))
+        && let Some(seconds) = sleep_duration(&words[at + 1..])
+    {
+        return Some(Intent::SleepIn(seconds));
+    }
+    let cancel = ["отмени", "отключи", "выключи", "убери", "сбрось", "удали", "останови"];
+    if (timer && words.first().is_some_and(|w| cancel.contains(w)))
+        || words == ["не", "выключайся"]
+        || (words.first() == Some(&"отмени") && has("выключени"))
+    {
+        return Some(Intent::CancelSleep);
+    }
+    None
 }
 
 /// "перемотай на 20 секунд вперед", "назад на 10 секунд", "с начала".
@@ -270,7 +367,7 @@ pub fn intent(text: &str) -> Option<Intent> {
     if text.split_whitespace().any(|w| w.starts_with("яндекс")) {
         return Some(Intent::Handover);
     }
-    if let Some(intent) = seek(&text).or_else(|| repeat(&text)) {
+    if let Some(intent) = sleep(&text).or_else(|| seek(&text)).or_else(|| repeat(&text)) {
         return Some(intent);
     }
     // Longest verbs first, so "хочу послушать" is not read as "послушать".
@@ -806,6 +903,36 @@ mod tests {
         assert_eq!(intent("Алиса выключи"), Some(Intent::Pause));
         assert_eq!(intent("Включи музыку"), Some(Intent::Resume));
         assert_eq!(intent("Играй"), Some(Intent::Resume));
+        for said in ["Трек назад", "песню назад", "Алиса, на трек назад", "назад на песню", "верни песню"] {
+            assert_eq!(intent(said), Some(Intent::Previous), "{said}");
+        }
+        for said in ["Трек вперёд", "песню вперед", "на трек вперед"] {
+            assert_eq!(intent(said), Some(Intent::Next), "{said}");
+        }
+        // With a duration it is still a seek.
+        assert_eq!(intent("назад на 10 секунд"), Some(Intent::Seek(-10)));
+        assert_eq!(intent("Алиса, выключись через 30 минут"), Some(Intent::SleepIn(1800)));
+        assert_eq!(intent("выключи музыку через час"), Some(Intent::SleepIn(3600)));
+        assert_eq!(intent("Выключи через полчаса"), Some(Intent::SleepIn(1800)));
+        assert_eq!(intent("выключись через полтора часа"), Some(Intent::SleepIn(5400)));
+        assert_eq!(intent("выключись через час двадцать"), Some(Intent::SleepIn(4800)));
+        assert_eq!(intent("поставь таймер сна на сорок пять минут"), Some(Intent::SleepIn(2700)));
+        assert_eq!(intent("останови музыку через 10 минут"), Some(Intent::SleepIn(600)));
+        assert_eq!(intent("выключись через 20"), Some(Intent::SleepIn(1200)));
+        assert_eq!(intent("отмени таймер сна"), Some(Intent::CancelSleep));
+        assert_eq!(intent("выключи таймер выключения"), Some(Intent::CancelSleep));
+        assert_eq!(intent("не выключайся"), Some(Intent::CancelSleep));
+        assert_eq!(intent("отмени выключение"), Some(Intent::CancelSleep));
+        // Alice's own timers and alarms stay hers.
+        assert_eq!(intent("отмени таймер"), None);
+        assert_eq!(intent("поставь таймер на 10 минут"), None);
+        assert_eq!(intent("разбуди меня через час"), None);
+        assert_eq!(intent("выключи свет через 10 минут"), None);
+        assert_eq!(intent("выключи телевизор через час"), None);
+        assert_eq!(spoken_duration(1800), "30 минут");
+        assert_eq!(spoken_duration(4800), "1 час 20 минут");
+        assert_eq!(spoken_duration(7260), "2 часа 1 минуту");
+        assert_eq!(spoken_duration(5 * 3600), "5 часов");
         assert_eq!(intent("Алиса, играй музыку"), Some(Intent::Resume));
         assert_eq!(intent("следующий трек"), Some(Intent::Next));
         // SoundCloud's bot protection blocks likes from the speaker, so they are left to Alice.

@@ -29,6 +29,12 @@ impl AudioGuard {
     pub fn hold(&self, duration: Duration) {
         *self.hold_until.lock().unwrap() = Some(tokio::time::Instant::now() + duration);
     }
+    /// Ends a `hold` early, once Alice has said what she had to: a station player that
+    /// started meanwhile (her own answer to another phrase, say) is paused at once.
+    pub fn release(&self) {
+        *self.hold_until.lock().unwrap() = None;
+        self.changed.notify_one();
+    }
     fn held(&self) -> bool {
         self.hold_until.lock().unwrap().is_some_and(|until| tokio::time::Instant::now() < until)
     }
@@ -105,6 +111,14 @@ mod tests {
         guard.nudge();
         tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), steady + 1);
+        // While Alice speaks for us nothing is paused; the end of her sentence pauses at once.
+        guard.hold(Duration::from_secs(20));
+        guard.nudge();
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), steady + 1);
+        guard.release();
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), steady + 2);
         guard.set_playing(false);
         tokio::task::yield_now().await;
         let paused = calls.load(Ordering::SeqCst);

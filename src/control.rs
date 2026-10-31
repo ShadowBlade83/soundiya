@@ -103,6 +103,13 @@ async fn handle(
             send(sender, Intent::Seek(seconds))
         }
         "RESTART" => send(sender, Intent::Restart),
+        "SLEEP" => match argument.to_ascii_lowercase().as_str() {
+            "off" | "cancel" => send(sender, Intent::CancelSleep),
+            minutes => match minutes.parse::<u32>() {
+                Ok(m) if (1..=720).contains(&m) => send(sender, Intent::SleepIn(m * 60)),
+                _ => Err("sleep takes minutes (1-720) or off".into()),
+            },
+        },
         "REPEAT" => match argument.to_ascii_lowercase().as_str() {
             "" | "on" => send(sender, Intent::Loop(true)),
             "off" => send(sender, Intent::Loop(false)),

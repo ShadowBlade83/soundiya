@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicU8, AtomicU64, Ordering},
         mpsc as std_mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use symphonia::core::{
     audio::{Channels, SampleBuffer},
@@ -38,6 +38,12 @@ pub const IDLE: u8 = 0;
 pub const PLAYING: u8 = 1;
 pub const PAUSED: u8 = 2;
 const STALL: Duration = Duration::from_secs(20);
+/// After a track ends the sound device stays open, fed with silence, this long: the next
+/// track then follows without closing and reopening it, which clicks on some stations.
+const KEEP_OPEN: Duration = Duration::from_secs(3);
+/// Each track (and playback after a pause) fades in over this many milliseconds, so a start
+/// in the middle of a waveform does not click.
+const FADE_IN_MS: u32 = 20;
 
 #[derive(Debug)]
 pub enum Event {
@@ -385,6 +391,8 @@ impl Resampler {
 struct Output {
     pcm: PCM,
     rate: u32,
+    /// The rate the device was opened for; another track at this rate can reuse it.
+    track_rate: u32,
     frames: u64,
     resampler: Option<Resampler>,
 }
@@ -413,6 +421,7 @@ impl Output {
         Ok(Self {
             pcm,
             rate,
+            track_rate,
             frames: 0,
             resampler: (rate != track_rate).then(|| Resampler::new(track_rate, rate)),
         })
@@ -516,6 +525,29 @@ impl Demux {
     }
 }
 
+/// A linear ramp from silence over the first `FADE_IN_MS` of a track.
+struct FadeIn {
+    done: u32,
+}
+impl FadeIn {
+    fn new() -> Self {
+        Self { done: 0 }
+    }
+    fn apply(&mut self, samples: &mut [i16], rate: u32) {
+        let total = (rate * FADE_IN_MS / 1000).max(1);
+        for frame in samples.chunks_exact_mut(CHANNELS) {
+            if self.done >= total {
+                return;
+            }
+            let factor = f64::from(self.done) / f64::from(total);
+            for sample in frame {
+                *sample = (f64::from(*sample) * factor) as i16;
+            }
+            self.done += 1;
+        }
+    }
+}
+
 enum Outcome {
     Ended,
     Stopped,
@@ -530,31 +562,67 @@ struct Worker {
 }
 impl Worker {
     fn run(self) {
+        // Open across tracks; closed on stop, on an error and when nothing follows a track.
+        let mut output: Option<Output> = None;
         let mut next = None;
         loop {
             let (generation, source, from_ms) = match next.take() {
                 Some(job) => job,
-                None => match self.receiver.recv() {
-                    Ok(Command::Play(generation, source, from_ms)) => (generation, source, from_ms),
-                    Ok(_) => continue,
-                    Err(_) => return,
+                None => match self.between_tracks(&mut output) {
+                    Some(job) => job,
+                    None => return,
                 },
             };
-            let result = self.track(generation, source, from_ms);
+            let result = self.track(generation, source, from_ms, &mut output);
             self.shared.state.store(IDLE, Ordering::Release);
             match result {
                 Ok(Outcome::Ended) => {
                     let _ = self.events.send(Event::Ended(generation));
                 }
-                Ok(Outcome::Stopped) => {}
+                Ok(Outcome::Stopped) => output = None,
                 Ok(Outcome::Replace(generation, source, from_ms)) => {
+                    // The rest of the old track still in the device buffer goes at once.
+                    if let Some(out) = &output {
+                        let _ = out.pcm.drop();
+                        let _ = out.pcm.prepare();
+                    }
                     next = Some((generation, source, from_ms));
                 }
                 // Whatever went wrong after the track was replaced is not an error.
-                Err(_) if self.shared.generation.load(Ordering::Acquire) != generation => {}
+                Err(_) if self.shared.generation.load(Ordering::Acquire) != generation => output = None,
                 Err(e) => {
+                    output = None;
                     let _ = self.events.send(Event::Failed(generation, e));
                 }
+            }
+        }
+    }
+
+    /// Waits for the next track. While the device is open it is kept fed with silence for
+    /// up to `KEEP_OPEN`, then drained and closed. `None` once the player is gone.
+    fn between_tracks(&self, output: &mut Option<Output>) -> Option<(u64, ChannelSource, u64)> {
+        let since = Instant::now();
+        while let Some(out) = output.as_mut() {
+            match self.receiver.try_recv() {
+                Ok(Command::Play(g, s, from)) => return Some((g, s, from)),
+                Ok(Command::Stop) => *output = None,
+                Ok(_) | Err(std_mpsc::TryRecvError::Empty) => {
+                    if since.elapsed() >= KEEP_OPEN {
+                        let _ = out.pcm.drain();
+                        *output = None;
+                    // Blocks while the buffer is full, which paces this loop.
+                    } else if out.write(&vec![0; (out.rate / 100) as usize * CHANNELS]).is_err() {
+                        *output = None;
+                    }
+                }
+                Err(std_mpsc::TryRecvError::Disconnected) => return None,
+            }
+        }
+        loop {
+            match self.receiver.recv() {
+                Ok(Command::Play(g, s, from)) => return Some((g, s, from)),
+                Ok(_) => {}
+                Err(_) => return None,
             }
         }
     }
@@ -582,13 +650,22 @@ impl Worker {
         }
     }
 
-    fn track(&self, generation: u64, source: ChannelSource, from_ms: u64) -> Result<Outcome, String> {
+    fn track(
+        &self,
+        generation: u64,
+        source: ChannelSource,
+        from_ms: u64,
+        output: &mut Option<Output>,
+    ) -> Result<Outcome, String> {
         let (mut demux, mut decoder) = Demux::open(source)?;
         // Audio still to drop before playing (a seek), and audio dropped so far, in µs.
         let mut skip_us = from_ms * 1000;
         let mut skipped_us: u64 = 0;
         self.shared.position_ms.store(from_ms, Ordering::Relaxed);
-        let mut output: Option<Output> = None;
+        if let Some(out) = output.as_mut() {
+            out.frames = 0; // the position counts from this track's start
+        }
+        let mut fade = FadeIn::new();
         let mut gain = Gain::new();
         let mut stereo: Vec<i16> = Vec::new();
         let mut resampled: Vec<i16> = Vec::new();
@@ -599,9 +676,10 @@ impl Worker {
                 Ok(Command::Play(g, s, from)) => return Ok(Outcome::Replace(g, s, from)),
                 Ok(Command::Skip(ms)) => skip_us += ms * 1000,
                 Ok(Command::Pause) => {
-                    if let Some(outcome) = self.paused(&output, &mut skip_us) {
+                    if let Some(outcome) = self.paused(output, &mut skip_us) {
                         return Ok(outcome);
                     }
+                    fade = FadeIn::new();
                 }
                 Ok(Command::Resume) | Err(std_mpsc::TryRecvError::Empty) => {}
                 Err(std_mpsc::TryRecvError::Disconnected) => return Ok(Outcome::Stopped),
@@ -627,8 +705,11 @@ impl Worker {
                 samples.get_or_insert_with(|| SampleBuffer::new(decoded.capacity() as u64, spec));
             buffer.copy_interleaved_ref(decoded);
             to_stereo(buffer.samples(), spec.channels.count().max(1), &mut stereo);
+            if output.as_ref().is_some_and(|o| o.track_rate != spec.rate) {
+                *output = None; // another rate: reopen
+            }
             if output.is_none() {
-                output = Some(Output::open(&self.device, spec.rate)?);
+                *output = Some(Output::open(&self.device, spec.rate)?);
             }
             let out = output.as_mut().unwrap();
             let data: &mut [i16] = match out.resampler.as_mut() {
@@ -640,6 +721,7 @@ impl Worker {
                 None => &mut stereo,
             };
             gain.apply_i16(data, self.ducking.active());
+            fade.apply(data, out.rate);
             out.write(data)?;
             if self.shared.state.swap(PLAYING, Ordering::AcqRel) == IDLE {
                 let _ = self.events.send(Event::Started(generation));
@@ -649,9 +731,7 @@ impl Worker {
                 Ordering::Relaxed,
             );
         }
-        if let Some(out) = &output {
-            let _ = out.pcm.drain();
-        }
+        // No drain: the device stays open for the next track (see `between_tracks`).
         Ok(Outcome::Ended)
     }
 }
@@ -659,6 +739,17 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tracks_fade_in_from_silence() {
+        let mut fade = FadeIn::new();
+        // 20 ms at 1 kHz is 20 frames; feed 30 stereo frames of full scale.
+        let mut data = [i16::MAX; 30 * CHANNELS];
+        fade.apply(&mut data[..10 * CHANNELS], 1000);
+        fade.apply(&mut data[10 * CHANNELS..], 1000);
+        assert_eq!(data[0], 0);
+        assert!(data[10 * CHANNELS] > data[5 * CHANNELS] && data[10 * CHANNELS] < i16::MAX);
+        assert_eq!(&data[20 * CHANNELS..], &[i16::MAX; 10 * CHANNELS][..]);
+    }
     #[test]
     fn hls_playlists_yield_absolute_init_and_segment_urls() {
         let playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4?sig=1\"\n#EXTINF:10,\ndata000.m4s?sig=1\n#EXTINF:10,\nhttps://cdn/x/data001.m4s\n#EXT-X-ENDLIST\n";

@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "soundiya"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alsa",
  "bytes",
